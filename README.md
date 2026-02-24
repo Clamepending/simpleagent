@@ -1,9 +1,9 @@
 # AdminAgent
 
-AdminAgent is a minimal OpenClaw-style gateway service for webhook integrations.
+AdminAgent is a local-first AI chat service.
 
-It receives webhook events through a generic inbox, records them for inspection, and can
-optionally forward a normalized payload to another downstream agent endpoint.
+It receives chat messages, keeps per-session history in memory, generates responses from an
+OpenAI-compatible endpoint, and can optionally forward assistant replies downstream.
 
 ## Run Locally (recommended for fast iteration)
 
@@ -13,8 +13,10 @@ optionally forward a normalized payload to another downstream agent endpoint.
 
 ```bash
 PORT=18789
-GATEWAY_TOKEN=change-me
-ADMINAGENT_FORWARD_ENABLED=1
+ADMINAGENT_LLM_URL=http://127.0.0.1:11434/v1/chat/completions
+ADMINAGENT_MODEL=llama3.2
+ADMINAGENT_LLM_API_KEY=replace-with-your-openai-api-key
+ADMINAGENT_FORWARD_ENABLED=0
 ADMINAGENT_FORWARD_URL=http://127.0.0.1:8000/hooks/inbox
 ADMINAGENT_FORWARD_TOKEN=replace-with-your-downstream-api-key
 ```
@@ -37,43 +39,33 @@ docker compose --env-file .env.docker.example up --build
 ```
 
 In Docker mode, `ADMINAGENT_FORWARD_URL` should usually use `host.docker.internal`.
+For a local model on your laptop, `ADMINAGENT_LLM_URL` should also use `host.docker.internal`.
 
 ## Environment
 
 - `PORT` (default: `18789`)
-- `GATEWAY_TOKEN` (optional Bearer token required for incoming hooks)
-- `GATEWAY_HOOK_PATH` (default: `inbox`)
-- `GATEWAY_MESSAGE_TEMPLATE` (optional message template with `{{field}}` placeholders)
+- `ADMINAGENT_LLM_URL` (OpenAI-compatible chat completions endpoint)
+- `ADMINAGENT_MODEL` (model name sent to LLM endpoint)
+- `ADMINAGENT_LLM_API_KEY` (Bearer token for LLM endpoint)
+- `ADMINAGENT_SYSTEM_PROMPT` (optional system prompt)
 - `ADMINAGENT_FORWARD_ENABLED` (default: `0`)
 - `ADMINAGENT_FORWARD_URL` (optional downstream endpoint)
 - `ADMINAGENT_FORWARD_TOKEN` (optional Bearer token for downstream forwarding)
-- `DISCORD_WEBHOOK_URL` (optional, enables `/api/actions/discord`)
-- `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` (optional, enables `/api/actions/telegram`)
 
 ## Endpoints
 
 - `GET /health`
 - `GET /api/events`
-- `POST /api/trigger` (manual trigger for tests)
-- `POST /hooks/<configured-path>` (default: `/hooks/inbox`)
-- `POST /api/actions/discord`
-- `POST /api/actions/telegram`
+- `POST /api/chat` (chat API with `session_id` + `message`)
+- `GET /api/sessions/<session_id>` (view in-memory history for a session)
 
-The chat UI at `/` displays current hook path, forward URL, and configured keys from `/health`.
+The chat UI at `/` uses `/api/chat` and displays current model/forward config from `/health`.
 
-## Payload accepted by inbox
-
-Expected fields (example):
+## Chat Request Example
 
 ```json
 {
-  "source": "videomemory",
-  "event_type": "task_update",
-  "task_id": "0",
-  "io_id": "net0",
-  "task_description": "Count people entering room",
-  "note": "Detected one person",
-  "task_status": "active",
-  "task_done": false
+  "session_id": "local-dev",
+  "message": "hello"
 }
 ```

@@ -5,10 +5,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+RUN pip install --no-cache-dir uv
+
+COPY pyproject.toml uv.lock /app/
+RUN uv sync --frozen --no-install-project
 
 COPY app.py /app/app.py
+
+ENV PATH="/app/.venv/bin:$PATH"
 
 EXPOSE 18789
 

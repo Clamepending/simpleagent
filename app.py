@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Minimal OpenClaw-style webhook gateway."""
+"""Local-first AI chat service with optional forwarding."""
 
 from __future__ import annotations
 
 import os
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import requests
 from flask import Flask, jsonify, request
@@ -20,7 +20,6 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 def _load_dotenv_file(path: str = ".env") -> None:
-    """Load KEY=VALUE pairs into environment without overriding existing vars."""
     if not os.path.exists(path):
         return
     with open(path, "r", encoding="utf-8") as f:
@@ -30,23 +29,24 @@ def _load_dotenv_file(path: str = ".env") -> None:
                 continue
             key, value = text.split("=", 1)
             key = key.strip()
-            if not key:
-                continue
-            os.environ.setdefault(key, value.strip())
+            if key:
+                os.environ.setdefault(key, value.strip())
 
 
-def render_template(template: str, values: Dict[str, Any]) -> str:
-    out = template
-    for key, value in values.items():
-        out = out.replace("{{" + str(key) + "}}", str(value))
-    return out
+def _mask_secret(value: str) -> str:
+    if not value:
+        return ""
+    if len(value) <= 8:
+        return "*" * len(value)
+    return f"{value[:4]}...{value[-4:]}"
 
 
-class GatewayState:
+class AppState:
     def __init__(self):
         self.lock = threading.Lock()
         self.events: List[Dict[str, Any]] = []
         self.last_forward: Optional[Dict[str, Any]] = None
+        self.sessions: Dict[str, List[Dict[str, Any]]] = {}
 
     def record_event(self, event: Dict[str, Any]) -> None:
         with self.lock:
@@ -57,37 +57,41 @@ class GatewayState:
         with self.lock:
             self.last_forward = info
 
+    def append_session(self, session_id: str, role: str, content: str) -> None:
+        with self.lock:
+            history = self.sessions.setdefault(session_id, [])
+            history.append({"role": role, "content": content, "ts": time.time()})
+            self.sessions[session_id] = history[-100:]
+
+    def get_session(self, session_id: str) -> List[Dict[str, Any]]:
+        with self.lock:
+            return list(self.sessions.get(session_id, []))
+
     def snapshot(self) -> Dict[str, Any]:
         with self.lock:
             return {
                 "events": list(self.events),
                 "last_forward": dict(self.last_forward) if self.last_forward else None,
+                "sessions": {"session_count": len(self.sessions), "session_ids": sorted(self.sessions.keys())},
             }
 
 
 def create_app() -> Flask:
     app = Flask(__name__)
-    state = GatewayState()
+    state = AppState()
     _load_dotenv_file()
 
-    hook_path = os.getenv("GATEWAY_HOOK_PATH", "inbox").strip("/") or "inbox"
-    token = os.getenv("GATEWAY_TOKEN", "").strip()
     forward_enabled = _env_bool("ADMINAGENT_FORWARD_ENABLED", False)
     forward_url = os.getenv("ADMINAGENT_FORWARD_URL", "").strip()
     forward_token = os.getenv("ADMINAGENT_FORWARD_TOKEN", "").strip()
-    message_template = os.getenv(
-        "GATEWAY_MESSAGE_TEMPLATE",
-        "VISION ALERT on device {{io_id}} (task {{task_id}}): {{note}}\nTask: {{task_description}}",
-    )
-
-    def _unauthorized():
-        return jsonify({"status": "error", "error": "unauthorized"}), 401
-
-    def _authorized() -> bool:
-        if not token:
-            return True
-        auth = request.headers.get("Authorization", "")
-        return auth == f"Bearer {token}"
+    llm_url = os.getenv("ADMINAGENT_LLM_URL", "https://api.openai.com/v1/chat/completions").strip()
+    llm_api_key = os.getenv("ADMINAGENT_LLM_API_KEY", "").strip()
+    llm_model = os.getenv("ADMINAGENT_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
+    llm_timeout_s = int(os.getenv("ADMINAGENT_LLM_TIMEOUT_S", "60"))
+    llm_system_prompt = os.getenv(
+        "ADMINAGENT_SYSTEM_PROMPT",
+        "You are AdminAgent, a concise, practical operations assistant.",
+    ).strip()
 
     def _forward(message: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         if not forward_enabled:
@@ -95,16 +99,10 @@ def create_app() -> Flask:
         if not forward_url:
             raise RuntimeError("ADMINAGENT_FORWARD_URL is required when ADMINAGENT_FORWARD_ENABLED=1")
 
-        body = {
-            "source": "adminagent",
-            "message": message,
-            "event": payload,
-            "received_at": time.time(),
-        }
         headers = {"Content-Type": "application/json"}
         if forward_token:
             headers["Authorization"] = f"Bearer {forward_token}"
-
+        body = {"source": "adminagent", "message": message, "event": payload, "received_at": time.time()}
         resp = requests.post(forward_url, json=body, headers=headers, timeout=30)
         resp.raise_for_status()
         data = resp.json() if resp.text else {}
@@ -112,34 +110,39 @@ def create_app() -> Flask:
         state.set_last_forward(result)
         return result
 
-    def _send_discord(message: str, username: Optional[str] = None) -> Dict[str, Any]:
-        webhook_url = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
-        if not webhook_url:
-            return {"status": "error", "error": "DISCORD_WEBHOOK_URL is not configured"}
-        body: Dict[str, Any] = {"content": message}
-        if username:
-            body["username"] = username
-        resp = requests.post(webhook_url, json=body, timeout=10)
-        if resp.status_code not in (200, 204):
-            return {"status": "error", "error": f"Discord returned status {resp.status_code}"}
-        return {"status": "ok", "channel": "discord"}
+    def _build_llm_messages(session_id: str, user_message: str) -> List[Dict[str, str]]:
+        history = state.get_session(session_id)[-20:]
+        messages: List[Dict[str, str]] = [{"role": "system", "content": llm_system_prompt}]
+        for item in history:
+            role = str(item.get("role", "")).strip()
+            content = str(item.get("content", "")).strip()
+            if role in {"user", "assistant"} and content:
+                messages.append({"role": role, "content": content})
+        messages.append({"role": "user", "content": user_message})
+        return messages
 
-    def _send_telegram(message: str) -> Dict[str, Any]:
-        bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-        chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-        if not bot_token:
-            return {"status": "error", "error": "TELEGRAM_BOT_TOKEN is not configured"}
-        if not chat_id:
-            return {"status": "error", "error": "TELEGRAM_CHAT_ID is not configured"}
-        resp = requests.post(
-            f"https://api.telegram.org/bot{bot_token}/sendMessage",
-            json={"chat_id": chat_id, "text": message},
-            timeout=10,
-        )
+    def _generate_chat_response(session_id: str, user_message: str) -> str:
+        if not llm_url:
+            raise RuntimeError("ADMINAGENT_LLM_URL is required for /api/chat")
+        if not llm_api_key:
+            raise RuntimeError("ADMINAGENT_LLM_API_KEY is required for /api/chat")
+
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {llm_api_key}"}
+        payload = {
+            "model": llm_model,
+            "messages": _build_llm_messages(session_id=session_id, user_message=user_message),
+            "temperature": 0.2,
+        }
+        resp = requests.post(llm_url, json=payload, headers=headers, timeout=llm_timeout_s)
+        resp.raise_for_status()
         data = resp.json() if resp.text else {}
-        if not resp.ok or not data.get("ok", False):
-            return {"status": "error", "error": data.get("description", f"Telegram returned status {resp.status_code}")}
-        return {"status": "ok", "channel": "telegram"}
+        choices = data.get("choices") if isinstance(data, dict) else None
+        if not isinstance(choices, list) or not choices:
+            raise RuntimeError("LLM response missing choices")
+        assistant_text = str((choices[0].get("message") or {}).get("content", "")).strip()
+        if not assistant_text:
+            raise RuntimeError("LLM response did not include assistant content")
+        return assistant_text
 
     @app.route("/", methods=["GET"])
     def index():
@@ -214,31 +217,35 @@ def create_app() -> Flask:
 </head>
 <body>
   <div class="wrap">
-    <h1>AdminAgent Chat Tester</h1>
-    <p class="muted">Send a message to <code>/api/trigger</code> and inspect forwarding behavior.</p>
+    <h1>AdminAgent Chat</h1>
+    <p class="muted">Chat via <code>/api/chat</code>. Session history is retained in memory by <code>session_id</code>.</p>
     <div id="status" class="status">Loading status...</div>
     <div id="chat" class="chat"></div>
     <form id="chatForm">
+      <input id="sessionInput" type="text" value="local-dev" aria-label="Session ID" style="max-width: 170px;" />
       <input id="msgInput" type="text" placeholder="Type a message to test your agent..." required />
       <button type="submit">Send</button>
     </form>
     <div class="meta">
-      Endpoint used: <code>/api/trigger</code><br>
-      Hook endpoint: <code id="hookPath">(loading)</code><br>
+      Endpoint used: <code>/api/chat</code><br>
+      Model endpoint: <code id="modelUrl">(loading)</code><br>
+      Model name: <code id="modelName">(loading)</code><br>
+      Model API key: <code id="modelKey">(loading)</code><br>
       Forward URL: <code id="forwardUrl">(loading)</code><br>
       Forward API key: <code id="forwardKey">(loading)</code><br>
-      Incoming webhook key: <code id="gatewayKey">(loading)</code><br>
-      If your downstream forwarding is enabled, each send will attempt to forward.
+      If forwarding is enabled, each assistant response is also forwarded.
     </div>
   </div>
   <script>
     const chat = document.getElementById("chat");
     const statusEl = document.getElementById("status");
     const forwardUrlEl = document.getElementById("forwardUrl");
-    const hookPathEl = document.getElementById("hookPath");
+    const modelUrlEl = document.getElementById("modelUrl");
+    const modelNameEl = document.getElementById("modelName");
+    const modelKeyEl = document.getElementById("modelKey");
     const forwardKeyEl = document.getElementById("forwardKey");
-    const gatewayKeyEl = document.getElementById("gatewayKey");
     const form = document.getElementById("chatForm");
+    const sessionInput = document.getElementById("sessionInput");
     const input = document.getElementById("msgInput");
 
     function addMessage(text, cls) {
@@ -256,46 +263,43 @@ def create_app() -> Flask:
         statusEl.textContent =
           "Service: " + data.service +
           " | Forward enabled: " + data.forward_enabled +
-          " | Hook: " + data.hook_path;
-        hookPathEl.textContent = data.hook_path || "(not set)";
+          " | Model: " + data.model;
         forwardUrlEl.textContent = data.forward_url || "(not set)";
+        modelUrlEl.textContent = data.llm_url || "(not set)";
+        modelNameEl.textContent = data.model || "(not set)";
+        modelKeyEl.textContent = data.llm_api_key || "(not set)";
         forwardKeyEl.textContent = data.forward_api_key || "(not set)";
-        gatewayKeyEl.textContent = data.gateway_token || "(not set)";
       } catch (err) {
         statusEl.textContent = "Health check failed: " + err;
+        modelUrlEl.textContent = "(health failed)";
+        modelNameEl.textContent = "(health failed)";
+        modelKeyEl.textContent = "(health failed)";
         forwardUrlEl.textContent = "(health failed)";
         forwardKeyEl.textContent = "(health failed)";
-        gatewayKeyEl.textContent = "(health failed)";
       }
     }
 
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
       const text = input.value.trim();
+      const sessionId = (sessionInput.value || "").trim() || "local-dev";
       if (!text) return;
 
       addMessage("You: " + text, "user");
       input.value = "";
 
-      const payload = {
-        source: "chat-ui",
-        event_type: "manual_chat",
-        task_id: "ui-manual",
-        io_id: "browser",
-        task_description: "Manual chat test from browser UI",
-        note: text,
-        task_status: "active",
-        task_done: false
-      };
-
       try {
-        const resp = await fetch("/api/trigger", {
+        const resp = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message: text, payload })
+          body: JSON.stringify({ session_id: sessionId, message: text })
         });
         const data = await resp.json();
-        addMessage("Agent result: " + JSON.stringify(data, null, 2), resp.ok ? "system" : "error");
+        if (resp.ok) {
+          addMessage("Assistant (" + sessionId + "): " + data.response, "system");
+        } else {
+          addMessage("Agent error: " + JSON.stringify(data, null, 2), "error");
+        }
       } catch (err) {
         addMessage("Request error: " + err, "error");
       }
@@ -314,13 +318,13 @@ def create_app() -> Flask:
             {
                 "status": "ok",
                 "service": "adminagent",
-                "hook_path": f"/hooks/{hook_path}",
                 "forward_enabled": forward_enabled,
                 "forward_url": forward_url,
-                "forward_api_key": forward_token,
-                "gateway_token": token,
-                "discord_configured": bool(os.getenv("DISCORD_WEBHOOK_URL", "").strip()),
-                "telegram_configured": bool(os.getenv("TELEGRAM_BOT_TOKEN", "").strip() and os.getenv("TELEGRAM_CHAT_ID", "").strip()),
+                "forward_api_key": _mask_secret(forward_token),
+                "llm_url": llm_url,
+                "llm_api_key": _mask_secret(llm_api_key),
+                "model": llm_model,
+                "sessions": state.snapshot().get("sessions"),
             }
         )
 
@@ -328,82 +332,61 @@ def create_app() -> Flask:
     def events():
         return jsonify({"status": "ok", **state.snapshot()})
 
-    @app.route("/api/trigger", methods=["POST"])
-    def manual_trigger():
-        data = request.get_json(silent=True) or {}
-        payload = data.get("payload") or {}
-        if not isinstance(payload, dict):
-            return jsonify({"status": "error", "error": "payload must be an object"}), 400
-        message = str(data.get("message", "")).strip() or render_template(message_template, payload)
+    @app.route("/api/sessions/<session_id>", methods=["GET"])
+    def get_session(session_id: str):
+        session_id = session_id.strip()
+        if not session_id:
+            return jsonify({"status": "error", "error": "session_id is required"}), 400
+        return jsonify({"status": "ok", "session_id": session_id, "history": state.get_session(session_id)})
 
+    @app.route("/api/chat", methods=["POST"])
+    def chat():
+        data = request.get_json(silent=True) or {}
+        session_id = str(data.get("session_id", "")).strip() or "default"
+        user_message = str(data.get("message", "")).strip()
+        if not user_message:
+            return jsonify({"status": "error", "error": "message is required"}), 400
+
+        state.append_session(session_id=session_id, role="user", content=user_message)
+        chat_payload = {
+            "source": "chat-ui",
+            "event_type": "chat_message",
+            "session_id": session_id,
+            "note": user_message,
+            "task_description": "User chat message",
+            "task_status": "active",
+            "task_done": False,
+        }
         event_record = {
             "received_at": time.time(),
-            "path": "/api/trigger",
-            "payload": payload,
-            "rendered_message": message,
+            "path": "/api/chat",
+            "session_id": session_id,
+            "payload": chat_payload,
+            "rendered_message": user_message,
             "forwarded": False,
         }
         try:
-            forward_result = _forward(message, payload)
+            assistant_text = _generate_chat_response(session_id=session_id, user_message=user_message)
+            state.append_session(session_id=session_id, role="assistant", content=assistant_text)
+            forward_result = _forward(
+                message=assistant_text,
+                payload={**chat_payload, "assistant_response": assistant_text},
+            )
             event_record["forwarded"] = bool(forward_result.get("ok"))
-            state.record_event(event_record)
-            return jsonify({"status": "ok", "result": forward_result})
-        except Exception as exc:
-            state.record_event({**event_record, "error": str(exc)})
-            return jsonify({"status": "error", "error": str(exc)}), 502
-
-    @app.route("/api/actions/discord", methods=["POST"])
-    def send_discord():
-        data = request.get_json(silent=True) or {}
-        message = str(data.get("message", "")).strip()
-        username = str(data.get("username", "")).strip() or None
-        if not message:
-            return jsonify({"status": "error", "error": "message is required"}), 400
-        result = _send_discord(message=message, username=username)
-        status_code = 200 if result.get("status") == "ok" else 400
-        return jsonify(result), status_code
-
-    @app.route("/api/actions/telegram", methods=["POST"])
-    def send_telegram():
-        data = request.get_json(silent=True) or {}
-        message = str(data.get("message", "")).strip()
-        if not message:
-            return jsonify({"status": "error", "error": "message is required"}), 400
-        result = _send_telegram(message=message)
-        status_code = 200 if result.get("status") == "ok" else 400
-        return jsonify(result), status_code
-
-    @app.route(f"/hooks/{hook_path}", methods=["POST"])
-    def hook():
-        if not _authorized():
-            return _unauthorized()
-        payload = request.get_json(silent=True)
-        if not isinstance(payload, dict):
-            return jsonify({"status": "error", "error": "Request body must be JSON object"}), 400
-
-        message = render_template(message_template, payload)
-        event_record = {
-            "received_at": time.time(),
-            "path": request.path,
-            "payload": payload,
-            "rendered_message": message,
-            "forwarded": False,
-        }
-        try:
-            forward_result = _forward(message, payload)
-            event_record["forwarded"] = bool(forward_result.get("ok"))
+            event_record["assistant_response"] = assistant_text
             state.record_event(event_record)
             return jsonify(
                 {
                     "status": "ok",
+                    "session_id": session_id,
+                    "response": assistant_text,
                     "forwarded": bool(forward_result.get("ok")),
-                    "message": message,
-                    "result": forward_result,
+                    "forward_result": forward_result,
                 }
             )
         except Exception as exc:
             state.record_event({**event_record, "error": str(exc)})
-            return jsonify({"status": "error", "error": str(exc), "message": message}), 502
+            return jsonify({"status": "error", "error": str(exc), "session_id": session_id}), 502
 
     return app
 
