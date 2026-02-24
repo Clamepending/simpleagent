@@ -1,0 +1,19 @@
+services:
+  adminagent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: adminagent
+    restart: unless-stopped
+    environment:
+      PORT: "18789"
+      GATEWAY_HOOK_PATH: "${GATEWAY_HOOK_PATH:-inbox}"
+      GATEWAY_TOKEN: "${GATEWAY_TOKEN:-change-me}"
+      ADMINAGENT_FORWARD_ENABLED: "${ADMINAGENT_FORWARD_ENABLED:-0}"
+      ADMINAGENT_FORWARD_URL: "${ADMINAGENT_FORWARD_URL:-}"
+      ADMINAGENT_FORWARD_TOKEN: "${ADMINAGENT_FORWARD_TOKEN:-}"
+      DISCORD_WEBHOOK_URL: "${DISCORD_WEBHOOK_URL:-}"
+      TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:-}"
+      TELEGRAM_CHAT_ID: "${TELEGRAM_CHAT_ID:-}"
+    ports:
+      - "18789:18789"
