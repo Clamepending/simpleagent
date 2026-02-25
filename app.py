@@ -4,9 +4,10 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import threading
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import requests
 from flask import Flask, jsonify, request
@@ -42,11 +43,11 @@ def _mask_secret(value: str) -> str:
 
 
 class AppState:
-    def __init__(self):
+    def __init__(self, session_store: "SqliteSessionStore"):
         self.lock = threading.Lock()
         self.events: List[Dict[str, Any]] = []
         self.last_forward: Optional[Dict[str, Any]] = None
-        self.sessions: Dict[str, List[Dict[str, Any]]] = {}
+        self.session_store = session_store
 
     def record_event(self, event: Dict[str, Any]) -> None:
         with self.lock:
@@ -58,28 +59,150 @@ class AppState:
             self.last_forward = info
 
     def append_session(self, session_id: str, role: str, content: str) -> None:
-        with self.lock:
-            history = self.sessions.setdefault(session_id, [])
-            history.append({"role": role, "content": content, "ts": time.time()})
-            self.sessions[session_id] = history[-100:]
+        self.session_store.append_message(session_id=session_id, role=role, content=content)
 
     def get_session(self, session_id: str) -> List[Dict[str, Any]]:
-        with self.lock:
-            return list(self.sessions.get(session_id, []))
+        return self.session_store.get_session(session_id=session_id)
+
+    def list_sessions(self) -> List[Dict[str, Any]]:
+        return self.session_store.list_sessions()
 
     def snapshot(self) -> Dict[str, Any]:
+        sessions_snapshot = self.session_store.snapshot()
         with self.lock:
             return {
                 "events": list(self.events),
                 "last_forward": dict(self.last_forward) if self.last_forward else None,
-                "sessions": {"session_count": len(self.sessions), "session_ids": sorted(self.sessions.keys())},
+                "sessions": sessions_snapshot,
             }
+
+
+class SqliteSessionStore:
+    def __init__(self, db_path: str, max_messages_per_session: int = 100):
+        self.db_path = db_path.strip() or "adminagent.db"
+        self.max_messages_per_session = max(1, int(max_messages_per_session))
+        self.lock = threading.Lock()
+        self._init_db()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_db(self) -> None:
+        if self.db_path != ":memory:":
+            parent = os.path.dirname(os.path.abspath(self.db_path))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+        with self.lock, self._connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS session_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    ts REAL NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_session_messages_session_id_id
+                ON session_messages(session_id, id)
+                """
+            )
+            conn.commit()
+
+    def append_message(self, session_id: str, role: str, content: str) -> None:
+        ts = time.time()
+        with self.lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO session_messages(session_id, role, content, ts) VALUES (?, ?, ?, ?)",
+                (session_id, role, content, ts),
+            )
+            conn.execute(
+                """
+                DELETE FROM session_messages
+                WHERE session_id = ?
+                  AND id NOT IN (
+                      SELECT id
+                      FROM session_messages
+                      WHERE session_id = ?
+                      ORDER BY id DESC
+                      LIMIT ?
+                  )
+                """,
+                (session_id, session_id, self.max_messages_per_session),
+            )
+            conn.commit()
+
+    def get_session(self, session_id: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        max_rows = self.max_messages_per_session if limit is None else max(1, int(limit))
+        with self.lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT role, content, ts
+                FROM (
+                    SELECT id, role, content, ts
+                    FROM session_messages
+                    WHERE session_id = ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                )
+                ORDER BY id ASC
+                """,
+                (session_id, max_rows),
+            ).fetchall()
+        return [{"role": row["role"], "content": row["content"], "ts": row["ts"]} for row in rows]
+
+    def list_sessions(self, limit: int = 200) -> List[Dict[str, Any]]:
+        with self.lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT session_id, COUNT(*) AS message_count, MAX(ts) AS updated_at
+                FROM session_messages
+                GROUP BY session_id
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+        return [
+            {
+                "session_id": row["session_id"],
+                "message_count": int(row["message_count"]),
+                "updated_at": float(row["updated_at"]) if row["updated_at"] is not None else None,
+            }
+            for row in rows
+        ]
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self.lock, self._connect() as conn:
+            count_row = conn.execute(
+                "SELECT COUNT(DISTINCT session_id) AS session_count FROM session_messages"
+            ).fetchone()
+            id_rows = conn.execute(
+                "SELECT DISTINCT session_id FROM session_messages ORDER BY session_id ASC"
+            ).fetchall()
+        return {
+            "session_count": int((count_row or {"session_count": 0})["session_count"]),
+            "session_ids": [row["session_id"] for row in id_rows],
+        }
 
 
 def create_app() -> Flask:
     app = Flask(__name__)
-    state = AppState()
     _load_dotenv_file()
+
+    session_db_path = os.getenv("ADMINAGENT_DB_PATH", "adminagent.db").strip() or "adminagent.db"
+    session_max_messages = int(os.getenv("ADMINAGENT_SESSION_MAX_MESSAGES", "100"))
+    state = AppState(
+        session_store=SqliteSessionStore(
+            db_path=session_db_path,
+            max_messages_per_session=session_max_messages,
+        )
+    )
 
     forward_enabled = _env_bool("ADMINAGENT_FORWARD_ENABLED", False)
     forward_url = os.getenv("ADMINAGENT_FORWARD_URL", "").strip()
@@ -218,7 +341,7 @@ def create_app() -> Flask:
 <body>
   <div class="wrap">
     <h1>AdminAgent Chat</h1>
-    <p class="muted">Chat via <code>/api/chat</code>. Session history is retained in memory by <code>session_id</code>.</p>
+    <p class="muted">Chat via <code>/api/chat</code>. Session history is persisted locally by <code>session_id</code>.</p>
     <div id="status" class="status">Loading status...</div>
     <div id="chat" class="chat"></div>
     <form id="chatForm">
@@ -324,6 +447,7 @@ def create_app() -> Flask:
                 "llm_url": llm_url,
                 "llm_api_key": _mask_secret(llm_api_key),
                 "model": llm_model,
+                "session_db_path": session_db_path,
                 "sessions": state.snapshot().get("sessions"),
             }
         )
@@ -338,6 +462,10 @@ def create_app() -> Flask:
         if not session_id:
             return jsonify({"status": "error", "error": "session_id is required"}), 400
         return jsonify({"status": "ok", "session_id": session_id, "history": state.get_session(session_id)})
+
+    @app.route("/api/sessions", methods=["GET"])
+    def list_sessions():
+        return jsonify({"status": "ok", "sessions": state.list_sessions()})
 
     @app.route("/api/chat", methods=["POST"])
     def chat():

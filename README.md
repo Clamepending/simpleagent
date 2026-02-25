@@ -2,7 +2,7 @@
 
 AdminAgent is a local-first AI chat service.
 
-It receives chat messages, keeps per-session history in memory, generates responses from an
+It receives chat messages, keeps per-session history in a local SQLite database, generates responses from an
 OpenAI-compatible endpoint, and can optionally forward assistant replies downstream.
 
 ## Run Locally (recommended for fast iteration)
@@ -16,6 +16,7 @@ PORT=18789
 ADMINAGENT_LLM_URL=http://127.0.0.1:11434/v1/chat/completions
 ADMINAGENT_MODEL=llama3.2
 ADMINAGENT_LLM_API_KEY=replace-with-your-openai-api-key
+ADMINAGENT_DB_PATH=./adminagent.db
 ADMINAGENT_FORWARD_ENABLED=0
 ADMINAGENT_FORWARD_URL=http://127.0.0.1:8000/hooks/inbox
 ADMINAGENT_FORWARD_TOKEN=replace-with-your-downstream-api-key
@@ -47,6 +48,8 @@ For a local model on your laptop, `ADMINAGENT_LLM_URL` should also use `host.doc
 - `ADMINAGENT_LLM_URL` (OpenAI-compatible chat completions endpoint)
 - `ADMINAGENT_MODEL` (model name sent to LLM endpoint)
 - `ADMINAGENT_LLM_API_KEY` (Bearer token for LLM endpoint)
+- `ADMINAGENT_DB_PATH` (default: `adminagent.db`, local SQLite file for session memory)
+- `ADMINAGENT_SESSION_MAX_MESSAGES` (default: `100`, per-session retained messages)
 - `ADMINAGENT_SYSTEM_PROMPT` (optional system prompt)
 - `ADMINAGENT_FORWARD_ENABLED` (default: `0`)
 - `ADMINAGENT_FORWARD_URL` (optional downstream endpoint)
@@ -57,7 +60,8 @@ For a local model on your laptop, `ADMINAGENT_LLM_URL` should also use `host.doc
 - `GET /health`
 - `GET /api/events`
 - `POST /api/chat` (chat API with `session_id` + `message`)
-- `GET /api/sessions/<session_id>` (view in-memory history for a session)
+- `GET /api/sessions` (list known sessions from local DB)
+- `GET /api/sessions/<session_id>` (view persisted history for a session)
 
 The chat UI at `/` uses `/api/chat` and displays current model/forward config from `/health`.
 

@@ -1,4 +1,5 @@
 import os
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -20,14 +21,17 @@ class _MockResp:
 
 class AdminAgentTests(unittest.TestCase):
     def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
         os.environ["ADMINAGENT_LLM_URL"] = "http://llm.test/v1/chat/completions"
         os.environ["ADMINAGENT_LLM_API_KEY"] = "test-key-123456"
         os.environ["ADMINAGENT_MODEL"] = "test-model"
         os.environ["ADMINAGENT_FORWARD_ENABLED"] = "0"
+        os.environ["ADMINAGENT_DB_PATH"] = os.path.join(self._tmpdir.name, "adminagent-test.db")
         os.environ.pop("ADMINAGENT_FORWARD_URL", None)
         os.environ.pop("ADMINAGENT_FORWARD_TOKEN", None)
 
     def tearDown(self):
+        self._tmpdir.cleanup()
         for key in [
             "ADMINAGENT_FORWARD_ENABLED",
             "ADMINAGENT_FORWARD_URL",
@@ -35,6 +39,7 @@ class AdminAgentTests(unittest.TestCase):
             "ADMINAGENT_LLM_URL",
             "ADMINAGENT_LLM_API_KEY",
             "ADMINAGENT_MODEL",
+            "ADMINAGENT_DB_PATH",
         ]:
             os.environ.pop(key, None)
 
@@ -82,6 +87,11 @@ class AdminAgentTests(unittest.TestCase):
         self.assertEqual(hist["history"][0]["role"], "user")
         self.assertEqual(hist["history"][1]["role"], "assistant")
 
+        sessions = client.get("/api/sessions").get_json()
+        self.assertEqual(sessions["status"], "ok")
+        self.assertEqual(len(sessions["sessions"]), 1)
+        self.assertEqual(sessions["sessions"][0]["session_id"], "s1")
+
     @patch("app.requests.post")
     def test_forwards_when_enabled(self, mock_post):
         os.environ["ADMINAGENT_FORWARD_ENABLED"] = "1"
@@ -106,6 +116,24 @@ class AdminAgentTests(unittest.TestCase):
         data = resp.get_json()
         self.assertEqual(data["llm_api_key"], "test...3456")
         self.assertEqual(data["forward_api_key"], "forw...-key")
+
+    @patch("app.requests.post")
+    def test_session_history_persists_across_app_instances(self, mock_post):
+        mock_post.return_value = _MockResp(
+            data={"choices": [{"message": {"content": "Persistent reply"}}]},
+        )
+
+        app1 = self._make_app()
+        client1 = app1.test_client()
+        resp = client1.post("/api/chat", json={"session_id": "persist-1", "message": "hello"})
+        self.assertEqual(resp.status_code, 200)
+
+        app2 = self._make_app()
+        client2 = app2.test_client()
+        hist = client2.get("/api/sessions/persist-1").get_json()
+        self.assertEqual(hist["status"], "ok")
+        self.assertEqual([m["role"] for m in hist["history"]], ["user", "assistant"])
+        self.assertEqual(hist["history"][1]["content"], "Persistent reply")
 
 
 if __name__ == "__main__":
