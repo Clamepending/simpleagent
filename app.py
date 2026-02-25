@@ -37,6 +37,31 @@ def _load_dotenv_file(path: str = ".env") -> None:
                 os.environ.setdefault(key, value.strip())
 
 
+def _upsert_env_var(path: str, key: str, value: str) -> None:
+    lines: List[str] = []
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+
+    updated = False
+    new_lines: List[str] = []
+    for line in lines:
+        text = line.strip()
+        if text.startswith(f"{key}="):
+            new_lines.append(f"{key}={value}\n")
+            updated = True
+        else:
+            new_lines.append(line)
+
+    if not updated:
+        if new_lines and not new_lines[-1].endswith("\n"):
+            new_lines[-1] = f"{new_lines[-1]}\n"
+        new_lines.append(f"{key}={value}\n")
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.writelines(new_lines)
+
+
 def _mask_secret(value: str) -> str:
     if not value:
         return ""
@@ -232,10 +257,21 @@ def create_app() -> Flask:
     shell_timeout_s = max(1, int(os.getenv("ADMINAGENT_SHELL_TIMEOUT_S", "20")))
     shell_max_output_chars = max(200, int(os.getenv("ADMINAGENT_SHELL_MAX_OUTPUT_CHARS", "8000")))
     shell_max_calls_per_turn = max(1, int(os.getenv("ADMINAGENT_SHELL_MAX_CALLS_PER_TURN", "3")))
+    telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    telegram_poll_enabled = _env_bool("TELEGRAM_POLL_ENABLED", True)
+    telegram_poll_timeout_s = max(1, min(50, int(os.getenv("TELEGRAM_POLL_TIMEOUT_S", "25"))))
+    telegram_poll_retry_s = max(1, int(os.getenv("TELEGRAM_POLL_RETRY_S", "5")))
 
     shell_resolved_cwd = os.path.abspath(shell_cwd)
     if not os.path.isdir(shell_resolved_cwd):
         shell_resolved_cwd = os.getcwd()
+    telegram_poll_state: Dict[str, Any] = {
+        "started_at": None,
+        "last_polled_at": None,
+        "last_update_id": None,
+        "last_error": "",
+    }
+    telegram_poll_lock = threading.Lock()
 
     def _forward(message: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         if not forward_enabled:
@@ -253,6 +289,37 @@ def create_app() -> Flask:
         result = {"ok": True, "forwarded_at": time.time(), "response": data}
         state.set_last_forward(result)
         return result
+
+    def _telegram_token_ready() -> bool:
+        return bool(telegram_bot_token) and not telegram_bot_token.startswith("replace-with-")
+
+    def _telegram_api(method: str, payload: Dict[str, Any]) -> Any:
+        if not telegram_bot_token:
+            raise RuntimeError("TELEGRAM_BOT_TOKEN is required for Telegram integration")
+        url = f"https://api.telegram.org/bot{telegram_bot_token}/{method}"
+        resp = requests.post(url, json=payload, timeout=30)
+        resp.raise_for_status()
+        data = resp.json() if resp.text else {}
+        if not isinstance(data, dict) or not data.get("ok"):
+            raise RuntimeError(f"Telegram API {method} failed: {json.dumps(data, ensure_ascii=True)}")
+        return data.get("result")
+
+    def _telegram_send_message(chat_id: int, text: str, reply_to_message_id: Optional[int]) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"chat_id": chat_id, "text": text}
+        if reply_to_message_id is not None:
+            payload["reply_to_message_id"] = reply_to_message_id
+        return _telegram_api("sendMessage", payload)
+
+    def _telegram_get_updates(offset: int, timeout_s: int) -> List[Dict[str, Any]]:
+        result = _telegram_api(
+            "getUpdates",
+            {
+                "offset": offset,
+                "timeout": timeout_s,
+                "allowed_updates": ["message"],
+            },
+        )
+        return result if isinstance(result, list) else []
 
     def _build_llm_messages(session_id: str, user_message: str) -> List[Dict[str, str]]:
         history = state.get_session(session_id)[-20:]
@@ -372,6 +439,131 @@ def create_app() -> Flask:
             )
         return "I hit the shell tool-call limit for this turn. Please narrow the request and try again."
 
+    def _process_telegram_message(message: Dict[str, Any], update_id: Optional[int], source_path: str) -> Dict[str, Any]:
+        chat = message.get("chat")
+        if not isinstance(chat, dict):
+            return {"status": "ignored", "reason": "missing chat"}
+
+        chat_id_raw = chat.get("id")
+        chat_id: Optional[int] = None
+        if isinstance(chat_id_raw, (int, str)) and str(chat_id_raw).strip():
+            try:
+                chat_id = int(chat_id_raw)
+            except ValueError:
+                chat_id = None
+        if chat_id is None:
+            return {"status": "ignored", "reason": "invalid chat id"}
+
+        user_message = str(message.get("text", "")).strip()
+        if not user_message:
+            return {"status": "ignored", "reason": "only text messages are supported"}
+
+        message_id_raw = message.get("message_id")
+        reply_to_message_id: Optional[int] = None
+        if isinstance(message_id_raw, (int, str)) and str(message_id_raw).strip():
+            try:
+                reply_to_message_id = int(message_id_raw)
+            except ValueError:
+                reply_to_message_id = None
+
+        session_id = f"telegram:{chat_id}"
+        state.append_session(session_id=session_id, role="user", content=user_message)
+        chat_payload = {
+            "source": "telegram",
+            "event_type": "telegram_message",
+            "session_id": session_id,
+            "note": user_message,
+            "task_description": "Telegram chat message",
+            "task_status": "active",
+            "task_done": False,
+            "telegram_update_id": update_id,
+            "telegram_chat_id": chat_id,
+            "telegram_message_id": reply_to_message_id,
+        }
+        event_record = {
+            "received_at": time.time(),
+            "path": source_path,
+            "session_id": session_id,
+            "payload": chat_payload,
+            "rendered_message": user_message,
+            "forwarded": False,
+            "telegram_sent": False,
+        }
+
+        assistant_text = _generate_chat_response(session_id=session_id, user_message=user_message)
+        state.append_session(session_id=session_id, role="assistant", content=assistant_text)
+        forward_result = _forward(
+            message=assistant_text,
+            payload={**chat_payload, "assistant_response": assistant_text},
+        )
+        _telegram_send_message(
+            chat_id=chat_id,
+            text=assistant_text,
+            reply_to_message_id=reply_to_message_id,
+        )
+        event_record["forwarded"] = bool(forward_result.get("ok"))
+        event_record["telegram_sent"] = True
+        event_record["assistant_response"] = assistant_text
+        state.record_event(event_record)
+        return {
+            "status": "ok",
+            "session_id": session_id,
+            "response": assistant_text,
+            "forwarded": bool(forward_result.get("ok")),
+            "telegram_sent": True,
+        }
+
+    def _run_telegram_polling() -> None:
+        offset = 0
+        with telegram_poll_lock:
+            telegram_poll_state["started_at"] = time.time()
+        while True:
+            if not telegram_poll_enabled or not _telegram_token_ready():
+                time.sleep(1.0)
+                continue
+            try:
+                updates = _telegram_get_updates(offset=offset, timeout_s=telegram_poll_timeout_s)
+                with telegram_poll_lock:
+                    telegram_poll_state["last_polled_at"] = time.time()
+                    telegram_poll_state["last_error"] = ""
+                for update in updates:
+                    if not isinstance(update, dict):
+                        continue
+                    update_id_raw = update.get("update_id")
+                    update_id: Optional[int] = None
+                    if isinstance(update_id_raw, (int, str)) and str(update_id_raw).strip():
+                        try:
+                            update_id = int(update_id_raw)
+                        except ValueError:
+                            update_id = None
+                    if update_id is not None:
+                        offset = max(offset, update_id + 1)
+                        with telegram_poll_lock:
+                            telegram_poll_state["last_update_id"] = update_id
+
+                    message = update.get("message")
+                    if not isinstance(message, dict):
+                        continue
+                    try:
+                        _process_telegram_message(
+                            message=message,
+                            update_id=update_id,
+                            source_path="/api/telegram/poll",
+                        )
+                    except Exception as exc:
+                        state.record_event(
+                            {
+                                "received_at": time.time(),
+                                "path": "/api/telegram/poll",
+                                "error": str(exc),
+                                "payload": {"update_id": update_id},
+                            }
+                        )
+            except Exception as exc:
+                with telegram_poll_lock:
+                    telegram_poll_state["last_error"] = str(exc)
+                time.sleep(float(telegram_poll_retry_s))
+
     @app.route("/", methods=["GET"])
     def index():
         return """<!doctype html>
@@ -461,8 +653,16 @@ def create_app() -> Flask:
       Model API key: <code id="modelKey">(loading)</code><br>
       Forward URL: <code id="forwardUrl">(loading)</code><br>
       Forward API key: <code id="forwardKey">(loading)</code><br>
+      Telegram bot token: <code id="telegramToken">(loading)</code><br>
+      Telegram enabled: <code id="telegramEnabled">(loading)</code><br>
+      Telegram mode: <code id="telegramMode">(loading)</code><br>
+      Telegram polling active: <code id="telegramPollingActive">(loading)</code><br>
       If forwarding is enabled, each assistant response is also forwarded.
     </div>
+    <form id="telegramForm" style="margin-top: 12px;">
+      <input id="telegramTokenInput" type="text" placeholder="Set TELEGRAM_BOT_TOKEN" />
+      <button type="submit">Save Telegram Token</button>
+    </form>
   </div>
   <script>
     const chat = document.getElementById("chat");
@@ -472,7 +672,13 @@ def create_app() -> Flask:
     const modelNameEl = document.getElementById("modelName");
     const modelKeyEl = document.getElementById("modelKey");
     const forwardKeyEl = document.getElementById("forwardKey");
+    const telegramTokenEl = document.getElementById("telegramToken");
+    const telegramEnabledEl = document.getElementById("telegramEnabled");
+    const telegramModeEl = document.getElementById("telegramMode");
+    const telegramPollingActiveEl = document.getElementById("telegramPollingActive");
     const form = document.getElementById("chatForm");
+    const telegramForm = document.getElementById("telegramForm");
+    const telegramTokenInput = document.getElementById("telegramTokenInput");
     const sessionInput = document.getElementById("sessionInput");
     const input = document.getElementById("msgInput");
 
@@ -497,6 +703,10 @@ def create_app() -> Flask:
         modelNameEl.textContent = data.model || "(not set)";
         modelKeyEl.textContent = data.llm_api_key || "(not set)";
         forwardKeyEl.textContent = data.forward_api_key || "(not set)";
+        telegramTokenEl.textContent = data.telegram_bot_token || "(not set)";
+        telegramEnabledEl.textContent = data.telegram_enabled ? "true" : "false";
+        telegramModeEl.textContent = data.telegram_mode || "(not set)";
+        telegramPollingActiveEl.textContent = data.telegram_polling_active ? "true" : "false";
       } catch (err) {
         statusEl.textContent = "Health check failed: " + err;
         modelUrlEl.textContent = "(health failed)";
@@ -504,6 +714,10 @@ def create_app() -> Flask:
         modelKeyEl.textContent = "(health failed)";
         forwardUrlEl.textContent = "(health failed)";
         forwardKeyEl.textContent = "(health failed)";
+        telegramTokenEl.textContent = "(health failed)";
+        telegramEnabledEl.textContent = "(health failed)";
+        telegramModeEl.textContent = "(health failed)";
+        telegramPollingActiveEl.textContent = "(health failed)";
       }
     }
 
@@ -533,6 +747,28 @@ def create_app() -> Flask:
       }
     });
 
+    telegramForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const token = (telegramTokenInput.value || "").trim();
+      try {
+        const resp = await fetch("/api/config/telegram", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ telegram_bot_token: token })
+        });
+        const data = await resp.json();
+        if (resp.ok) {
+          addMessage("Updated Telegram token. Enabled: " + data.telegram_enabled, "system");
+          telegramTokenInput.value = "";
+          await loadHealth();
+        } else {
+          addMessage("Telegram config error: " + JSON.stringify(data, null, 2), "error");
+        }
+      } catch (err) {
+        addMessage("Telegram config request error: " + err, "error");
+      }
+    });
+
     loadHealth();
     addMessage("Ready. Type a message and click Send.", "system");
   </script>
@@ -542,6 +778,8 @@ def create_app() -> Flask:
 
     @app.route("/health", methods=["GET"])
     def health():
+        with telegram_poll_lock:
+            poll_snapshot = dict(telegram_poll_state)
         return jsonify(
             {
                 "status": "ok",
@@ -557,6 +795,13 @@ def create_app() -> Flask:
                 "shell_cwd": shell_resolved_cwd,
                 "shell_timeout_s": shell_timeout_s,
                 "shell_max_calls_per_turn": shell_max_calls_per_turn,
+                "telegram_enabled": _telegram_token_ready(),
+                "telegram_bot_token": _mask_secret(telegram_bot_token),
+                "telegram_mode": "long-polling",
+                "telegram_poll_enabled": telegram_poll_enabled,
+                "telegram_poll_timeout_s": telegram_poll_timeout_s,
+                "telegram_polling_active": bool(telegram_poll_enabled and _telegram_token_ready()),
+                "telegram_poll_state": poll_snapshot,
                 "sessions": state.snapshot().get("sessions"),
             }
         )
@@ -575,6 +820,37 @@ def create_app() -> Flask:
     @app.route("/api/sessions", methods=["GET"])
     def list_sessions():
         return jsonify({"status": "ok", "sessions": state.list_sessions()})
+
+    @app.route("/api/config/telegram", methods=["POST"])
+    def update_telegram_config():
+        nonlocal telegram_bot_token
+        data = request.get_json(silent=True) or {}
+        token = str(data.get("telegram_bot_token", "")).strip()
+
+        telegram_bot_token = token
+        os.environ["TELEGRAM_BOT_TOKEN"] = token
+        _upsert_env_var(".env", "TELEGRAM_BOT_TOKEN", token)
+
+        return jsonify(
+            {
+                "status": "ok",
+                "telegram_enabled": _telegram_token_ready(),
+                "telegram_bot_token": _mask_secret(telegram_bot_token),
+                "message": "TELEGRAM_BOT_TOKEN updated",
+            }
+        )
+
+    @app.route("/api/telegram/webhook", methods=["POST"])
+    def telegram_webhook():
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "error": "Webhook mode is disabled. Telegram integration runs in long polling mode.",
+                }
+            ),
+            410,
+        )
 
     @app.route("/api/chat", methods=["POST"])
     def chat():
@@ -624,6 +900,14 @@ def create_app() -> Flask:
         except Exception as exc:
             state.record_event({**event_record, "error": str(exc)})
             return jsonify({"status": "error", "error": str(exc), "session_id": session_id}), 502
+
+    if telegram_poll_enabled:
+        telegram_thread = threading.Thread(
+            target=_run_telegram_polling,
+            name="telegram-poller",
+            daemon=True,
+        )
+        telegram_thread.start()
 
     return app
 
