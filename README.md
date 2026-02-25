@@ -17,6 +17,11 @@ ADMINAGENT_LLM_URL=http://127.0.0.1:11434/v1/chat/completions
 ADMINAGENT_MODEL=llama3.2
 ADMINAGENT_LLM_API_KEY=replace-with-your-openai-api-key
 ADMINAGENT_DB_PATH=./adminagent.db
+ADMINAGENT_SHELL_ENABLED=1
+ADMINAGENT_SHELL_CWD=.
+ADMINAGENT_SHELL_TIMEOUT_S=20
+ADMINAGENT_SHELL_MAX_OUTPUT_CHARS=8000
+ADMINAGENT_SHELL_MAX_CALLS_PER_TURN=3
 ADMINAGENT_FORWARD_ENABLED=0
 ADMINAGENT_FORWARD_URL=http://127.0.0.1:8000/hooks/inbox
 ADMINAGENT_FORWARD_TOKEN=replace-with-your-downstream-api-key
@@ -51,6 +56,11 @@ For a local model on your laptop, `ADMINAGENT_LLM_URL` should also use `host.doc
 - `ADMINAGENT_DB_PATH` (default: `adminagent.db`, local SQLite file for session memory)
 - `ADMINAGENT_SESSION_MAX_MESSAGES` (default: `100`, per-session retained messages)
 - `ADMINAGENT_SYSTEM_PROMPT` (optional system prompt)
+- `ADMINAGENT_SHELL_ENABLED` (default: `0`, enable model-requested shell commands)
+- `ADMINAGENT_SHELL_CWD` (default: `.`, working directory for shell commands)
+- `ADMINAGENT_SHELL_TIMEOUT_S` (default: `20`, per-command timeout in seconds)
+- `ADMINAGENT_SHELL_MAX_OUTPUT_CHARS` (default: `8000`, max chars kept from stdout/stderr)
+- `ADMINAGENT_SHELL_MAX_CALLS_PER_TURN` (default: `3`, max shell commands per `/api/chat` turn)
 - `ADMINAGENT_FORWARD_ENABLED` (default: `0`)
 - `ADMINAGENT_FORWARD_URL` (optional downstream endpoint)
 - `ADMINAGENT_FORWARD_TOKEN` (optional Bearer token for downstream forwarding)

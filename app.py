@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import json
+import re
+import subprocess
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -40,6 +43,15 @@ def _mask_secret(value: str) -> str:
     if len(value) <= 8:
         return "*" * len(value)
     return f"{value[:4]}...{value[-4:]}"
+
+
+def _truncate_text(value: str, max_chars: int) -> str:
+    if max_chars < 1:
+        return ""
+    if len(value) <= max_chars:
+        return value
+    clipped = value[: max(1, max_chars)]
+    return f"{clipped}\n...[truncated]"
 
 
 class AppState:
@@ -215,6 +227,15 @@ def create_app() -> Flask:
         "ADMINAGENT_SYSTEM_PROMPT",
         "You are AdminAgent, a concise, practical operations assistant.",
     ).strip()
+    shell_enabled = _env_bool("ADMINAGENT_SHELL_ENABLED", False)
+    shell_cwd = os.getenv("ADMINAGENT_SHELL_CWD", ".").strip() or "."
+    shell_timeout_s = max(1, int(os.getenv("ADMINAGENT_SHELL_TIMEOUT_S", "20")))
+    shell_max_output_chars = max(200, int(os.getenv("ADMINAGENT_SHELL_MAX_OUTPUT_CHARS", "8000")))
+    shell_max_calls_per_turn = max(1, int(os.getenv("ADMINAGENT_SHELL_MAX_CALLS_PER_TURN", "3")))
+
+    shell_resolved_cwd = os.path.abspath(shell_cwd)
+    if not os.path.isdir(shell_resolved_cwd):
+        shell_resolved_cwd = os.getcwd()
 
     def _forward(message: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         if not forward_enabled:
@@ -235,7 +256,19 @@ def create_app() -> Flask:
 
     def _build_llm_messages(session_id: str, user_message: str) -> List[Dict[str, str]]:
         history = state.get_session(session_id)[-20:]
-        messages: List[Dict[str, str]] = [{"role": "system", "content": llm_system_prompt}]
+        effective_system_prompt = llm_system_prompt
+        if shell_enabled:
+            effective_system_prompt = (
+                f"{llm_system_prompt}\n\n"
+                "You can request shell access when needed by responding with exactly one line in this format:\n"
+                "<tool:shell>your shell command</tool:shell>\n"
+                "Rules:\n"
+                "- Use shell only when required to answer accurately.\n"
+                "- Keep commands minimal and non-interactive.\n"
+                "- After tool output is returned to you, provide a normal user-facing answer.\n"
+                "- Do not wrap the tool line in markdown."
+            )
+        messages: List[Dict[str, str]] = [{"role": "system", "content": effective_system_prompt}]
         for item in history:
             role = str(item.get("role", "")).strip()
             content = str(item.get("content", "")).strip()
@@ -244,7 +277,55 @@ def create_app() -> Flask:
         messages.append({"role": "user", "content": user_message})
         return messages
 
-    def _generate_chat_response(session_id: str, user_message: str) -> str:
+    def _extract_shell_command(text: str) -> Optional[str]:
+        match = re.fullmatch(r"\s*<tool:shell>(.+?)</tool:shell>\s*", text, flags=re.DOTALL)
+        if not match:
+            return None
+        command = match.group(1).strip()
+        return command or None
+
+    def _run_shell(command: str) -> Dict[str, Any]:
+        started = time.time()
+        try:
+            completed = subprocess.run(
+                command,
+                shell=True,
+                cwd=shell_resolved_cwd,
+                capture_output=True,
+                text=True,
+                timeout=shell_timeout_s,
+            )
+            return {
+                "ok": True,
+                "command": command,
+                "cwd": shell_resolved_cwd,
+                "exit_code": completed.returncode,
+                "stdout": _truncate_text(completed.stdout or "", shell_max_output_chars),
+                "stderr": _truncate_text(completed.stderr or "", shell_max_output_chars),
+                "duration_ms": int((time.time() - started) * 1000),
+            }
+        except subprocess.TimeoutExpired as exc:
+            return {
+                "ok": False,
+                "command": command,
+                "cwd": shell_resolved_cwd,
+                "error": f"timed out after {shell_timeout_s}s",
+                "stdout": _truncate_text(exc.stdout or "", shell_max_output_chars),
+                "stderr": _truncate_text(exc.stderr or "", shell_max_output_chars),
+                "duration_ms": int((time.time() - started) * 1000),
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "command": command,
+                "cwd": shell_resolved_cwd,
+                "error": str(exc),
+                "stdout": "",
+                "stderr": "",
+                "duration_ms": int((time.time() - started) * 1000),
+            }
+
+    def _call_llm(messages: List[Dict[str, str]]) -> str:
         if not llm_url:
             raise RuntimeError("ADMINAGENT_LLM_URL is required for /api/chat")
         if not llm_api_key:
@@ -253,7 +334,7 @@ def create_app() -> Flask:
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {llm_api_key}"}
         payload = {
             "model": llm_model,
-            "messages": _build_llm_messages(session_id=session_id, user_message=user_message),
+            "messages": messages,
             "temperature": 0.2,
         }
         resp = requests.post(llm_url, json=payload, headers=headers, timeout=llm_timeout_s)
@@ -266,6 +347,30 @@ def create_app() -> Flask:
         if not assistant_text:
             raise RuntimeError("LLM response did not include assistant content")
         return assistant_text
+
+    def _generate_chat_response(session_id: str, user_message: str) -> str:
+        messages = _build_llm_messages(session_id=session_id, user_message=user_message)
+        for _ in range(shell_max_calls_per_turn + 1):
+            assistant_text = _call_llm(messages)
+            shell_command = _extract_shell_command(assistant_text)
+            if not shell_command:
+                return assistant_text
+            if not shell_enabled:
+                return "Shell access is disabled by configuration."
+
+            shell_result = _run_shell(shell_command)
+            messages.append({"role": "assistant", "content": assistant_text})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "TOOL_RESULT shell\n"
+                        f"{json.dumps(shell_result, ensure_ascii=True)}\n"
+                        "Now continue and answer the user directly."
+                    ),
+                }
+            )
+        return "I hit the shell tool-call limit for this turn. Please narrow the request and try again."
 
     @app.route("/", methods=["GET"])
     def index():
@@ -448,6 +553,10 @@ def create_app() -> Flask:
                 "llm_api_key": _mask_secret(llm_api_key),
                 "model": llm_model,
                 "session_db_path": session_db_path,
+                "shell_enabled": shell_enabled,
+                "shell_cwd": shell_resolved_cwd,
+                "shell_timeout_s": shell_timeout_s,
+                "shell_max_calls_per_turn": shell_max_calls_per_turn,
                 "sessions": state.snapshot().get("sessions"),
             }
         )
