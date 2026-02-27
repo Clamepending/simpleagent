@@ -27,6 +27,8 @@ class AdminAgentTests(unittest.TestCase):
         os.environ["ADMINAGENT_MODEL"] = "test-model"
         os.environ["ADMINAGENT_FORWARD_ENABLED"] = "0"
         os.environ["ADMINAGENT_DB_PATH"] = os.path.join(self._tmpdir.name, "adminagent-test.db")
+        os.environ["TELEGRAM_POLL_ENABLED"] = "0"
+        os.environ.pop("TELEGRAM_BOT_TOKEN", None)
         os.environ.pop("ADMINAGENT_FORWARD_URL", None)
         os.environ.pop("ADMINAGENT_FORWARD_TOKEN", None)
 
@@ -40,6 +42,8 @@ class AdminAgentTests(unittest.TestCase):
             "ADMINAGENT_LLM_API_KEY",
             "ADMINAGENT_MODEL",
             "ADMINAGENT_DB_PATH",
+            "TELEGRAM_POLL_ENABLED",
+            "TELEGRAM_BOT_TOKEN",
         ]:
             os.environ.pop(key, None)
 

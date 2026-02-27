@@ -261,6 +261,10 @@ def create_app() -> Flask:
     telegram_poll_enabled = _env_bool("TELEGRAM_POLL_ENABLED", True)
     telegram_poll_timeout_s = max(1, min(50, int(os.getenv("TELEGRAM_POLL_TIMEOUT_S", "25"))))
     telegram_poll_retry_s = max(1, int(os.getenv("TELEGRAM_POLL_RETRY_S", "5")))
+    openai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    anthropic_api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    google_api_key = os.getenv("GOOGLE_API_KEY", "").strip()
+    gateway_token = os.getenv("GATEWAY_TOKEN", "").strip()
 
     shell_resolved_cwd = os.path.abspath(shell_cwd)
     if not os.path.isdir(shell_resolved_cwd):
@@ -584,6 +588,23 @@ def create_app() -> Flask:
     h1 { margin: 0 0 10px; font-size: 24px; }
     .muted { color: #a8b0d4; margin: 0 0 16px; }
     .status { font-size: 14px; color: #9cf7c1; margin-bottom: 12px; }
+    .tabs { display: flex; gap: 8px; margin-bottom: 12px; }
+    .tab-btn {
+      border: 1px solid #2b3f7a;
+      border-radius: 10px;
+      padding: 8px 12px;
+      background: #101935;
+      color: #dbe4ff;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    .tab-btn.active {
+      background: #3552a6;
+      border-color: #3e56a8;
+      color: white;
+    }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
     .chat {
       border: 1px solid #23315f;
       border-radius: 12px;
@@ -604,7 +625,34 @@ def create_app() -> Flask:
     .system { background: #1d2a52; }
     .error { background: #60252b; }
     form { display: flex; gap: 8px; }
+    .settings-form {
+      display: block;
+      border: 1px solid #23315f;
+      border-radius: 12px;
+      background: #101935;
+      padding: 12px;
+    }
+    .settings-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+    .settings-row label {
+      width: 180px;
+      font-size: 13px;
+      color: #b3b9d6;
+    }
     input[type="text"] {
+      flex: 1;
+      background: #0f1733;
+      color: #e8ecff;
+      border: 1px solid #2b3f7a;
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-size: 14px;
+    }
+    input[type="password"] {
       flex: 1;
       background: #0f1733;
       color: #e8ecff;
@@ -640,31 +688,77 @@ def create_app() -> Flask:
     <h1>AdminAgent Chat</h1>
     <p class="muted">Chat via <code>/api/chat</code>. Session history is persisted locally by <code>session_id</code>.</p>
     <div id="status" class="status">Loading status...</div>
-    <div id="chat" class="chat"></div>
-    <form id="chatForm">
-      <input id="sessionInput" type="text" value="local-dev" aria-label="Session ID" style="max-width: 170px;" />
-      <input id="msgInput" type="text" placeholder="Type a message to test your agent..." required />
-      <button type="submit">Send</button>
-    </form>
-    <div class="meta">
-      Endpoint used: <code>/api/chat</code><br>
-      Model endpoint: <code id="modelUrl">(loading)</code><br>
-      Model name: <code id="modelName">(loading)</code><br>
-      Model API key: <code id="modelKey">(loading)</code><br>
-      Forward URL: <code id="forwardUrl">(loading)</code><br>
-      Forward API key: <code id="forwardKey">(loading)</code><br>
-      Telegram bot token: <code id="telegramToken">(loading)</code><br>
-      Telegram enabled: <code id="telegramEnabled">(loading)</code><br>
-      Telegram mode: <code id="telegramMode">(loading)</code><br>
-      Telegram polling active: <code id="telegramPollingActive">(loading)</code><br>
-      If forwarding is enabled, each assistant response is also forwarded.
+    <div class="tabs">
+      <button id="tabChatBtn" class="tab-btn active" type="button">Chat</button>
+      <button id="tabSettingsBtn" class="tab-btn" type="button">Settings</button>
     </div>
-    <form id="telegramForm" style="margin-top: 12px;">
-      <input id="telegramTokenInput" type="text" placeholder="Set TELEGRAM_BOT_TOKEN" />
-      <button type="submit">Save Telegram Token</button>
-    </form>
+
+    <section id="tabChat" class="tab-panel active">
+      <div id="chat" class="chat"></div>
+      <form id="chatForm">
+        <input id="sessionInput" type="text" value="local-dev" aria-label="Session ID" style="max-width: 170px;" />
+        <input id="msgInput" type="text" placeholder="Type a message to test your agent..." required />
+        <button type="submit">Send</button>
+      </form>
+      <div class="meta">
+        Endpoint used: <code>/api/chat</code><br>
+        Model endpoint: <code id="modelUrl">(loading)</code><br>
+        Model name: <code id="modelName">(loading)</code><br>
+        Model API key (active): <code id="modelKey">(loading)</code><br>
+        Forward URL: <code id="forwardUrl">(loading)</code><br>
+        Forward API key: <code id="forwardKey">(loading)</code><br>
+        If forwarding is enabled, each assistant response is also forwarded.
+      </div>
+    </section>
+
+    <section id="tabSettings" class="tab-panel">
+      <form id="settingsForm" class="settings-form">
+        <div class="settings-row">
+          <label for="openaiKeyInput">OpenAI API key</label>
+          <input id="openaiKeyInput" type="password" placeholder="sk-..." />
+        </div>
+        <div class="settings-row">
+          <label for="anthropicKeyInput">Anthropic API key</label>
+          <input id="anthropicKeyInput" type="password" placeholder="sk-ant-..." />
+        </div>
+        <div class="settings-row">
+          <label for="googleKeyInput">Google API key</label>
+          <input id="googleKeyInput" type="password" placeholder="AIza..." />
+        </div>
+        <div class="settings-row">
+          <label for="telegramTokenInput">Telegram bot token</label>
+          <input id="telegramTokenInput" type="password" placeholder="123456:ABC-DEF..." />
+        </div>
+        <button type="submit">Save Settings</button>
+      </form>
+      <div class="meta">
+        OpenAI key: <code id="openaiKeyMasked">(loading)</code><br>
+        Anthropic key: <code id="anthropicKeyMasked">(loading)</code><br>
+        Google key: <code id="googleKeyMasked">(loading)</code><br>
+        Telegram bot token: <code id="telegramToken">(loading)</code><br>
+        Telegram enabled: <code id="telegramEnabled">(loading)</code><br>
+        Telegram mode: <code id="telegramMode">(loading)</code><br>
+        Telegram polling active: <code id="telegramPollingActive">(loading)</code><br>
+      </div>
+    </section>
   </div>
   <script>
+    const tabChatBtn = document.getElementById("tabChatBtn");
+    const tabSettingsBtn = document.getElementById("tabSettingsBtn");
+    const tabChat = document.getElementById("tabChat");
+    const tabSettings = document.getElementById("tabSettings");
+
+    function showTab(name) {
+      const isChat = name === "chat";
+      tabChat.classList.toggle("active", isChat);
+      tabSettings.classList.toggle("active", !isChat);
+      tabChatBtn.classList.toggle("active", isChat);
+      tabSettingsBtn.classList.toggle("active", !isChat);
+    }
+
+    tabChatBtn.addEventListener("click", () => showTab("chat"));
+    tabSettingsBtn.addEventListener("click", () => showTab("settings"));
+
     const chat = document.getElementById("chat");
     const statusEl = document.getElementById("status");
     const forwardUrlEl = document.getElementById("forwardUrl");
@@ -676,8 +770,14 @@ def create_app() -> Flask:
     const telegramEnabledEl = document.getElementById("telegramEnabled");
     const telegramModeEl = document.getElementById("telegramMode");
     const telegramPollingActiveEl = document.getElementById("telegramPollingActive");
+    const openaiKeyMaskedEl = document.getElementById("openaiKeyMasked");
+    const anthropicKeyMaskedEl = document.getElementById("anthropicKeyMasked");
+    const googleKeyMaskedEl = document.getElementById("googleKeyMasked");
     const form = document.getElementById("chatForm");
-    const telegramForm = document.getElementById("telegramForm");
+    const settingsForm = document.getElementById("settingsForm");
+    const openaiKeyInput = document.getElementById("openaiKeyInput");
+    const anthropicKeyInput = document.getElementById("anthropicKeyInput");
+    const googleKeyInput = document.getElementById("googleKeyInput");
     const telegramTokenInput = document.getElementById("telegramTokenInput");
     const sessionInput = document.getElementById("sessionInput");
     const input = document.getElementById("msgInput");
@@ -707,6 +807,9 @@ def create_app() -> Flask:
         telegramEnabledEl.textContent = data.telegram_enabled ? "true" : "false";
         telegramModeEl.textContent = data.telegram_mode || "(not set)";
         telegramPollingActiveEl.textContent = data.telegram_polling_active ? "true" : "false";
+        openaiKeyMaskedEl.textContent = data.openai_api_key || "(not set)";
+        anthropicKeyMaskedEl.textContent = data.anthropic_api_key || "(not set)";
+        googleKeyMaskedEl.textContent = data.google_api_key || "(not set)";
       } catch (err) {
         statusEl.textContent = "Health check failed: " + err;
         modelUrlEl.textContent = "(health failed)";
@@ -718,6 +821,9 @@ def create_app() -> Flask:
         telegramEnabledEl.textContent = "(health failed)";
         telegramModeEl.textContent = "(health failed)";
         telegramPollingActiveEl.textContent = "(health failed)";
+        openaiKeyMaskedEl.textContent = "(health failed)";
+        anthropicKeyMaskedEl.textContent = "(health failed)";
+        googleKeyMaskedEl.textContent = "(health failed)";
       }
     }
 
@@ -747,25 +853,33 @@ def create_app() -> Flask:
       }
     });
 
-    telegramForm.addEventListener("submit", async (e) => {
+    settingsForm.addEventListener("submit", async (e) => {
       e.preventDefault();
-      const token = (telegramTokenInput.value || "").trim();
+      const payload = {
+        openai_api_key: (openaiKeyInput.value || "").trim(),
+        anthropic_api_key: (anthropicKeyInput.value || "").trim(),
+        google_api_key: (googleKeyInput.value || "").trim(),
+        telegram_bot_token: (telegramTokenInput.value || "").trim(),
+      };
       try {
-        const resp = await fetch("/api/config/telegram", {
+        const resp = await fetch("/api/config/settings", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ telegram_bot_token: token })
+          body: JSON.stringify(payload)
         });
         const data = await resp.json();
         if (resp.ok) {
-          addMessage("Updated Telegram token. Enabled: " + data.telegram_enabled, "system");
+          addMessage("Settings updated successfully.", "system");
+          openaiKeyInput.value = "";
+          anthropicKeyInput.value = "";
+          googleKeyInput.value = "";
           telegramTokenInput.value = "";
           await loadHealth();
         } else {
-          addMessage("Telegram config error: " + JSON.stringify(data, null, 2), "error");
+          addMessage("Settings error: " + JSON.stringify(data, null, 2), "error");
         }
       } catch (err) {
-        addMessage("Telegram config request error: " + err, "error");
+        addMessage("Settings request error: " + err, "error");
       }
     });
 
@@ -790,6 +904,9 @@ def create_app() -> Flask:
                 "llm_url": llm_url,
                 "llm_api_key": _mask_secret(llm_api_key),
                 "model": llm_model,
+                "openai_api_key": _mask_secret(openai_api_key),
+                "anthropic_api_key": _mask_secret(anthropic_api_key),
+                "google_api_key": _mask_secret(google_api_key),
                 "session_db_path": session_db_path,
                 "shell_enabled": shell_enabled,
                 "shell_cwd": shell_resolved_cwd,
@@ -809,6 +926,39 @@ def create_app() -> Flask:
     @app.route("/api/events", methods=["GET"])
     def events():
         return jsonify({"status": "ok", **state.snapshot()})
+
+    @app.route("/hooks/videomemory-alert", methods=["POST"])
+    def videomemory_hook():
+        expected = gateway_token
+        if expected:
+            auth_header = request.headers.get("Authorization", "")
+            expected_header = f"Bearer {expected}"
+            if auth_header != expected_header:
+                return jsonify({"status": "error", "error": "unauthorized"}), 401
+
+        payload = request.get_json(silent=True) or {}
+        note = str(payload.get("note", "")).strip()
+        io_id = str(payload.get("io_id", "")).strip() or "unknown"
+        task_id = str(payload.get("task_id", "")).strip() or "unknown"
+        task_desc = str(payload.get("task_description", "")).strip()
+        session_id = f"videomemory:{io_id}"
+
+        rendered = f"VideoMemory alert on {io_id} task {task_id}: {note or '(empty note)'}"
+        if task_desc:
+            rendered = f"{rendered}\nTask: {task_desc}"
+
+        state.append_session(session_id=session_id, role="user", content=rendered)
+        state.record_event(
+            {
+                "received_at": time.time(),
+                "path": "/hooks/videomemory-alert",
+                "session_id": session_id,
+                "payload": payload,
+                "rendered_message": rendered,
+                "forwarded": False,
+            }
+        )
+        return jsonify({"status": "ok", "session_id": session_id, "recorded": True})
 
     @app.route("/api/sessions/<session_id>", methods=["GET"])
     def get_session(session_id: str):
@@ -837,6 +987,40 @@ def create_app() -> Flask:
                 "telegram_enabled": _telegram_token_ready(),
                 "telegram_bot_token": _mask_secret(telegram_bot_token),
                 "message": "TELEGRAM_BOT_TOKEN updated",
+            }
+        )
+
+    @app.route("/api/config/settings", methods=["POST"])
+    def update_settings():
+        nonlocal telegram_bot_token, openai_api_key, anthropic_api_key, google_api_key
+        data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict):
+            return jsonify({"status": "error", "error": "JSON body is required"}), 400
+
+        openai_api_key = str(data.get("openai_api_key", "")).strip()
+        anthropic_api_key = str(data.get("anthropic_api_key", "")).strip()
+        google_api_key = str(data.get("google_api_key", "")).strip()
+        telegram_bot_token = str(data.get("telegram_bot_token", "")).strip()
+
+        os.environ["OPENAI_API_KEY"] = openai_api_key
+        os.environ["ANTHROPIC_API_KEY"] = anthropic_api_key
+        os.environ["GOOGLE_API_KEY"] = google_api_key
+        os.environ["TELEGRAM_BOT_TOKEN"] = telegram_bot_token
+
+        _upsert_env_var(".env", "OPENAI_API_KEY", openai_api_key)
+        _upsert_env_var(".env", "ANTHROPIC_API_KEY", anthropic_api_key)
+        _upsert_env_var(".env", "GOOGLE_API_KEY", google_api_key)
+        _upsert_env_var(".env", "TELEGRAM_BOT_TOKEN", telegram_bot_token)
+
+        return jsonify(
+            {
+                "status": "ok",
+                "openai_api_key": _mask_secret(openai_api_key),
+                "anthropic_api_key": _mask_secret(anthropic_api_key),
+                "google_api_key": _mask_secret(google_api_key),
+                "telegram_enabled": _telegram_token_ready(),
+                "telegram_bot_token": _mask_secret(telegram_bot_token),
+                "message": "Settings updated",
             }
         )
 
