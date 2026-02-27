@@ -10,7 +10,7 @@ import re
 import subprocess
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from flask import Flask, jsonify, request
@@ -244,9 +244,7 @@ def create_app() -> Flask:
     forward_enabled = _env_bool("ADMINAGENT_FORWARD_ENABLED", False)
     forward_url = os.getenv("ADMINAGENT_FORWARD_URL", "").strip()
     forward_token = os.getenv("ADMINAGENT_FORWARD_TOKEN", "").strip()
-    llm_url = os.getenv("ADMINAGENT_LLM_URL", "https://api.openai.com/v1/chat/completions").strip()
-    llm_api_key = os.getenv("ADMINAGENT_LLM_API_KEY", "").strip()
-    llm_model = os.getenv("ADMINAGENT_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
+    default_model = os.getenv("ADMINAGENT_MODEL", "gpt-5-mini").strip() or "gpt-5-mini"
     llm_timeout_s = int(os.getenv("ADMINAGENT_LLM_TIMEOUT_S", "60"))
     llm_system_prompt = os.getenv(
         "ADMINAGENT_SYSTEM_PROMPT",
@@ -265,6 +263,42 @@ def create_app() -> Flask:
     anthropic_api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     google_api_key = os.getenv("GOOGLE_API_KEY", "").strip()
     gateway_token = os.getenv("GATEWAY_TOKEN", "").strip()
+    model_catalog: Dict[str, List[Dict[str, str]]] = {
+        "openai": [
+            {"id": "gpt-5.3-codex", "label": "GPT 5.3-codex"},
+            {"id": "gpt-5-thinking-high", "label": "GPT-5-Thinking (High)"},
+            {"id": "gpt-5-mini", "label": "GPT-5 mini"},
+            {"id": "gpt-5.2-pro", "label": "GPT-5.2 Pro"},
+        ],
+        "anthropic": [
+            {"id": "claude-opus-4-6", "label": "Opus 4.6"},
+            {"id": "claude-sonnet-4-6", "label": "Sonnet 4.6"},
+            {"id": "claude-haiku-4-5", "label": "Haiku 4.5"},
+        ],
+        "google": [
+            {"id": "gemini-3.1-pro", "api_model": "gemini-pro-latest", "label": "Gemini 3.1 Pro"},
+            {"id": "gemini-3-flash", "api_model": "gemini-flash-latest", "label": "Gemini 3 Flash"},
+        ],
+    }
+
+    def _flatten_model_catalog() -> List[Dict[str, str]]:
+        flat: List[Dict[str, str]] = []
+        for provider, models in model_catalog.items():
+            for model in models:
+                model_id = str(model.get("id", "")).strip()
+                if not model_id:
+                    continue
+                flat.append(
+                    {
+                        "provider": provider,
+                        "id": model_id,
+                        "api_model": str(model.get("api_model", "")).strip() or model_id,
+                        "label": str(model.get("label", "")).strip() or model_id,
+                    }
+                )
+        return flat
+
+    flat_model_catalog = _flatten_model_catalog()
 
     shell_resolved_cwd = os.path.abspath(shell_cwd)
     if not os.path.isdir(shell_resolved_cwd):
@@ -396,33 +430,153 @@ def create_app() -> Flask:
                 "duration_ms": int((time.time() - started) * 1000),
             }
 
-    def _call_llm(messages: List[Dict[str, str]]) -> str:
-        if not llm_url:
-            raise RuntimeError("ADMINAGENT_LLM_URL is required for /api/chat")
-        if not llm_api_key:
-            raise RuntimeError("ADMINAGENT_LLM_API_KEY is required for /api/chat")
+    def _resolve_model(selected_model: Optional[str]) -> str:
+        model = str(selected_model or "").strip()
+        return model or default_model
 
-        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {llm_api_key}"}
+    def _resolve_provider_and_model(selected_model: Optional[str]) -> Tuple[str, str]:
+        model = _resolve_model(selected_model)
+        for entry in flat_model_catalog:
+            if model == entry["id"]:
+                return entry["provider"], entry["api_model"]
+        if ":" in model:
+            provider_hint, model_name = model.split(":", 1)
+            provider = provider_hint.strip().lower()
+            model_name = model_name.strip()
+            if provider in {"openai", "anthropic", "google"} and model_name:
+                return provider, model_name
+
+        lower = model.lower()
+        if lower.startswith("claude"):
+            return "anthropic", model
+        if lower.startswith("gemini"):
+            return "google", model
+        return "openai", model
+
+    def _split_messages_for_provider(messages: List[Dict[str, str]]) -> Tuple[str, List[Dict[str, str]]]:
+        system_parts: List[str] = []
+        convo: List[Dict[str, str]] = []
+        for message in messages:
+            role = str(message.get("role", "")).strip()
+            content = str(message.get("content", "")).strip()
+            if not content:
+                continue
+            if role == "system":
+                system_parts.append(content)
+            elif role in {"user", "assistant"}:
+                convo.append({"role": role, "content": content})
+        return "\n\n".join(system_parts).strip(), convo
+
+    def _call_openai(messages: List[Dict[str, str]], model_name: str) -> str:
+        if not openai_api_key:
+            raise RuntimeError("OPENAI_API_KEY is required for OpenAI models")
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {openai_api_key}"}
         payload = {
-            "model": llm_model,
+            "model": model_name,
             "messages": messages,
             "temperature": 0.2,
         }
-        resp = requests.post(llm_url, json=payload, headers=headers, timeout=llm_timeout_s)
-        resp.raise_for_status()
+        resp = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            json=payload,
+            headers=headers,
+            timeout=llm_timeout_s,
+        )
+        if resp.status_code >= 400:
+            detail = (resp.text or "").strip()
+            raise RuntimeError(f"OpenAI API error {resp.status_code}: {detail[:500] or 'request failed'}")
         data = resp.json() if resp.text else {}
         choices = data.get("choices") if isinstance(data, dict) else None
         if not isinstance(choices, list) or not choices:
-            raise RuntimeError("LLM response missing choices")
+            raise RuntimeError("OpenAI response missing choices")
         assistant_text = str((choices[0].get("message") or {}).get("content", "")).strip()
         if not assistant_text:
-            raise RuntimeError("LLM response did not include assistant content")
+            raise RuntimeError("OpenAI response did not include assistant content")
         return assistant_text
 
-    def _generate_chat_response(session_id: str, user_message: str) -> str:
+    def _call_anthropic(messages: List[Dict[str, str]], model_name: str) -> str:
+        if not anthropic_api_key:
+            raise RuntimeError("ANTHROPIC_API_KEY is required for Anthropic models")
+        system_prompt, convo = _split_messages_for_provider(messages)
+        anthropic_messages = [
+            {"role": msg["role"], "content": [{"type": "text", "text": msg["content"]}]}
+            for msg in convo
+        ]
+        payload: Dict[str, Any] = {
+            "model": model_name,
+            "max_tokens": 1024,
+            "messages": anthropic_messages,
+        }
+        if system_prompt:
+            payload["system"] = system_prompt
+        headers = {
+            "Content-Type": "application/json",
+            "x-api-key": anthropic_api_key,
+            "anthropic-version": "2023-06-01",
+        }
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            json=payload,
+            headers=headers,
+            timeout=llm_timeout_s,
+        )
+        if resp.status_code >= 400:
+            detail = (resp.text or "").strip()
+            hint = ""
+            if resp.status_code == 404:
+                hint = " (model may be unavailable for this key)"
+            raise RuntimeError(
+                f"Anthropic API error {resp.status_code}{hint}: {detail[:500] or 'request failed'}"
+            )
+        data = resp.json() if resp.text else {}
+        content_blocks = data.get("content") if isinstance(data, dict) else None
+        if not isinstance(content_blocks, list) or not content_blocks:
+            raise RuntimeError("Anthropic response missing content")
+        text_parts = [str(block.get("text", "")) for block in content_blocks if isinstance(block, dict)]
+        assistant_text = "\n".join([part for part in text_parts if part]).strip()
+        if not assistant_text:
+            raise RuntimeError("Anthropic response did not include assistant content")
+        return assistant_text
+
+    def _call_google(messages: List[Dict[str, str]], model_name: str) -> str:
+        if not google_api_key:
+            raise RuntimeError("GOOGLE_API_KEY is required for Google models")
+        system_prompt, convo = _split_messages_for_provider(messages)
+        contents: List[Dict[str, Any]] = []
+        for msg in convo:
+            role = "model" if msg["role"] == "assistant" else "user"
+            contents.append({"role": role, "parts": [{"text": msg["content"]}]})
+        payload: Dict[str, Any] = {"contents": contents}
+        if system_prompt:
+            payload["systemInstruction"] = {"parts": [{"text": system_prompt}]}
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={google_api_key}"
+        resp = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=llm_timeout_s)
+        if resp.status_code >= 400:
+            detail = (resp.text or "").strip()
+            raise RuntimeError(f"Google API error {resp.status_code}: {detail[:500] or 'request failed'}")
+        data = resp.json() if resp.text else {}
+        candidates = data.get("candidates") if isinstance(data, dict) else None
+        if not isinstance(candidates, list) or not candidates:
+            raise RuntimeError("Google response missing candidates")
+        parts = ((candidates[0].get("content") or {}).get("parts") or [])
+        text_parts = [str(part.get("text", "")) for part in parts if isinstance(part, dict)]
+        assistant_text = "\n".join([part for part in text_parts if part]).strip()
+        if not assistant_text:
+            raise RuntimeError("Google response did not include assistant content")
+        return assistant_text
+
+    def _call_llm(messages: List[Dict[str, str]], selected_model: Optional[str]) -> str:
+        provider, model_name = _resolve_provider_and_model(selected_model)
+        if provider == "anthropic":
+            return _call_anthropic(messages=messages, model_name=model_name)
+        if provider == "google":
+            return _call_google(messages=messages, model_name=model_name)
+        return _call_openai(messages=messages, model_name=model_name)
+
+    def _generate_chat_response(session_id: str, user_message: str, selected_model: Optional[str]) -> str:
         messages = _build_llm_messages(session_id=session_id, user_message=user_message)
         for _ in range(shell_max_calls_per_turn + 1):
-            assistant_text = _call_llm(messages)
+            assistant_text = _call_llm(messages=messages, selected_model=selected_model)
             shell_command = _extract_shell_command(assistant_text)
             if not shell_command:
                 return assistant_text
@@ -494,7 +648,11 @@ def create_app() -> Flask:
             "telegram_sent": False,
         }
 
-        assistant_text = _generate_chat_response(session_id=session_id, user_message=user_message)
+        assistant_text = _generate_chat_response(
+            session_id=session_id,
+            user_message=user_message,
+            selected_model=default_model,
+        )
         state.append_session(session_id=session_id, role="assistant", content=assistant_text)
         forward_result = _forward(
             message=assistant_text,
@@ -605,6 +763,81 @@ def create_app() -> Flask:
     }
     .tab-panel { display: none; }
     .tab-panel.active { display: block; }
+    .chat-layout {
+      display: flex;
+      gap: 12px;
+    }
+    .session-sidebar {
+      width: 230px;
+      border: 1px solid #23315f;
+      border-radius: 12px;
+      background: #101935;
+      padding: 10px;
+      height: 448px;
+      display: flex;
+      flex-direction: column;
+    }
+    .session-sidebar-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
+      font-size: 13px;
+      color: #c5cff8;
+    }
+    .session-sidebar-actions {
+      display: flex;
+      gap: 6px;
+    }
+    .icon-btn {
+      width: 28px;
+      min-width: 28px;
+      height: 28px;
+      border-radius: 999px;
+      padding: 0;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 18px;
+      line-height: 1;
+    }
+    .session-list {
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .session-item {
+      width: 100%;
+      text-align: left;
+      border: 1px solid #2b3f7a;
+      background: #0f1733;
+      color: #dce5ff;
+      border-radius: 8px;
+      padding: 8px;
+      cursor: pointer;
+      font-size: 12px;
+    }
+    .session-item.active {
+      border-color: #3e56a8;
+      background: #1d2a52;
+    }
+    .session-item-id {
+      display: block;
+      font-size: 12px;
+      font-weight: 600;
+      margin-bottom: 2px;
+      word-break: break-all;
+    }
+    .session-item-meta {
+      display: block;
+      font-size: 11px;
+      color: #a8b0d4;
+    }
+    .chat-main {
+      flex: 1;
+      min-width: 0;
+    }
     .chat {
       border: 1px solid #23315f;
       border-radius: 12px;
@@ -643,6 +876,40 @@ def create_app() -> Flask:
       font-size: 13px;
       color: #b3b9d6;
     }
+    .events-panel {
+      border: 1px solid #23315f;
+      border-radius: 12px;
+      background: #101935;
+      padding: 12px;
+    }
+    .events-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+      color: #c5cff8;
+      font-size: 13px;
+    }
+    .events-list {
+      max-height: 430px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .event-item {
+      border: 1px solid #2b3f7a;
+      border-radius: 8px;
+      background: #0f1733;
+      padding: 8px;
+      font-size: 12px;
+      color: #dce5ff;
+    }
+    .event-item-head {
+      color: #a8b0d4;
+      font-size: 11px;
+      margin-bottom: 4px;
+    }
     input[type="text"] {
       flex: 1;
       background: #0f1733;
@@ -654,6 +921,14 @@ def create_app() -> Flask:
     }
     input[type="password"] {
       flex: 1;
+      background: #0f1733;
+      color: #e8ecff;
+      border: 1px solid #2b3f7a;
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-size: 14px;
+    }
+    select {
       background: #0f1733;
       color: #e8ecff;
       border: 1px solid #2b3f7a;
@@ -681,6 +956,15 @@ def create_app() -> Flask:
       border-radius: 6px;
       padding: 1px 6px;
     }
+    @media (max-width: 900px) {
+      .chat-layout {
+        flex-direction: column;
+      }
+      .session-sidebar {
+        width: auto;
+        height: 180px;
+      }
+    }
   </style>
 </head>
 <body>
@@ -691,20 +975,33 @@ def create_app() -> Flask:
     <div class="tabs">
       <button id="tabChatBtn" class="tab-btn active" type="button">Chat</button>
       <button id="tabSettingsBtn" class="tab-btn" type="button">Settings</button>
+      <button id="tabEventsBtn" class="tab-btn" type="button">Events</button>
     </div>
 
     <section id="tabChat" class="tab-panel active">
-      <div id="chat" class="chat"></div>
-      <form id="chatForm">
-        <input id="sessionInput" type="text" value="local-dev" aria-label="Session ID" style="max-width: 170px;" />
-        <input id="msgInput" type="text" placeholder="Type a message to test your agent..." required />
-        <button type="submit">Send</button>
-      </form>
+      <div class="chat-layout">
+        <aside class="session-sidebar">
+          <div class="session-sidebar-head">
+            <strong>Sessions</strong>
+            <div class="session-sidebar-actions">
+              <button id="newSessionBtn" type="button" class="icon-btn" aria-label="New session" title="New session">+</button>
+              <button id="refreshSessionsBtn" type="button">Refresh</button>
+            </div>
+          </div>
+          <div id="sessionList" class="session-list"></div>
+        </aside>
+        <div class="chat-main">
+          <div id="chat" class="chat"></div>
+          <form id="chatForm">
+            <select id="modelSelect" aria-label="Model" style="max-width: 240px;"></select>
+            <input id="msgInput" type="text" placeholder="Type a message to test your agent..." required />
+            <button type="submit">Send</button>
+          </form>
+        </div>
+      </div>
       <div class="meta">
         Endpoint used: <code>/api/chat</code><br>
-        Model endpoint: <code id="modelUrl">(loading)</code><br>
-        Model name: <code id="modelName">(loading)</code><br>
-        Model API key (active): <code id="modelKey">(loading)</code><br>
+        Default model: <code id="modelName">(loading)</code><br>
         Forward URL: <code id="forwardUrl">(loading)</code><br>
         Forward API key: <code id="forwardKey">(loading)</code><br>
         If forwarding is enabled, each assistant response is also forwarded.
@@ -741,30 +1038,46 @@ def create_app() -> Flask:
         Telegram polling active: <code id="telegramPollingActive">(loading)</code><br>
       </div>
     </section>
+
+    <section id="tabEvents" class="tab-panel">
+      <div class="events-panel">
+        <div class="events-head">
+          <strong>Event Log</strong>
+          <button id="refreshEventsBtn" type="button">Refresh</button>
+        </div>
+        <div id="eventsList" class="events-list"></div>
+      </div>
+    </section>
   </div>
   <script>
     const tabChatBtn = document.getElementById("tabChatBtn");
     const tabSettingsBtn = document.getElementById("tabSettingsBtn");
+    const tabEventsBtn = document.getElementById("tabEventsBtn");
     const tabChat = document.getElementById("tabChat");
     const tabSettings = document.getElementById("tabSettings");
+    const tabEvents = document.getElementById("tabEvents");
 
     function showTab(name) {
-      const isChat = name === "chat";
-      tabChat.classList.toggle("active", isChat);
-      tabSettings.classList.toggle("active", !isChat);
-      tabChatBtn.classList.toggle("active", isChat);
-      tabSettingsBtn.classList.toggle("active", !isChat);
+      tabChat.classList.toggle("active", name === "chat");
+      tabSettings.classList.toggle("active", name === "settings");
+      tabEvents.classList.toggle("active", name === "events");
+      tabChatBtn.classList.toggle("active", name === "chat");
+      tabSettingsBtn.classList.toggle("active", name === "settings");
+      tabEventsBtn.classList.toggle("active", name === "events");
+      if (name === "events") {
+        loadEvents().catch((err) => addMessage("Events load error: " + err, "error"));
+      }
     }
 
     tabChatBtn.addEventListener("click", () => showTab("chat"));
     tabSettingsBtn.addEventListener("click", () => showTab("settings"));
+    tabEventsBtn.addEventListener("click", () => showTab("events"));
 
     const chat = document.getElementById("chat");
     const statusEl = document.getElementById("status");
     const forwardUrlEl = document.getElementById("forwardUrl");
-    const modelUrlEl = document.getElementById("modelUrl");
     const modelNameEl = document.getElementById("modelName");
-    const modelKeyEl = document.getElementById("modelKey");
+    const modelSelect = document.getElementById("modelSelect");
     const forwardKeyEl = document.getElementById("forwardKey");
     const telegramTokenEl = document.getElementById("telegramToken");
     const telegramEnabledEl = document.getElementById("telegramEnabled");
@@ -773,14 +1086,85 @@ def create_app() -> Flask:
     const openaiKeyMaskedEl = document.getElementById("openaiKeyMasked");
     const anthropicKeyMaskedEl = document.getElementById("anthropicKeyMasked");
     const googleKeyMaskedEl = document.getElementById("googleKeyMasked");
+    const eventsListEl = document.getElementById("eventsList");
+    const refreshEventsBtn = document.getElementById("refreshEventsBtn");
+    const sessionListEl = document.getElementById("sessionList");
+    const newSessionBtn = document.getElementById("newSessionBtn");
+    const refreshSessionsBtn = document.getElementById("refreshSessionsBtn");
     const form = document.getElementById("chatForm");
     const settingsForm = document.getElementById("settingsForm");
     const openaiKeyInput = document.getElementById("openaiKeyInput");
     const anthropicKeyInput = document.getElementById("anthropicKeyInput");
     const googleKeyInput = document.getElementById("googleKeyInput");
     const telegramTokenInput = document.getElementById("telegramTokenInput");
-    const sessionInput = document.getElementById("sessionInput");
     const input = document.getElementById("msgInput");
+    let selectedSessionId = "local-dev";
+
+    const MODEL_CATALOG = {
+      openai: [
+        { id: "gpt-5.3-codex", label: "GPT 5.3-codex", description: "Coding-focused GPT-5 model" },
+        { id: "gpt-5-thinking-high", label: "GPT-5-Thinking (High)", description: "High-reasoning GPT-5 mode" },
+        { id: "gpt-5-mini", label: "GPT-5 mini", description: "Fast and efficient GPT-5 option" },
+        { id: "gpt-5.2-pro", label: "GPT-5.2 Pro", description: "High-capability GPT-5.2 model" },
+      ],
+      anthropic: [
+        { id: "claude-opus-4-6", label: "Opus 4.6", description: "Most capable for ambitious work" },
+        { id: "claude-sonnet-4-6", label: "Sonnet 4.6", description: "Balanced performance and speed" },
+        { id: "claude-haiku-4-5", label: "Haiku 4.5", description: "Fastest for quick answers" },
+      ],
+      google: [
+        { id: "gemini-3.1-pro", apiModel: "gemini-pro-latest", label: "Gemini 3.1 Pro", description: "Latest Gemini Pro alias" },
+        { id: "gemini-3-flash", apiModel: "gemini-flash-latest", label: "Gemini 3 Flash", description: "Latest Gemini Flash alias" },
+      ],
+    };
+
+    function providerLabel(p) {
+      if (p === "anthropic") return "Anthropic";
+      if (p === "google") return "Google";
+      return "OpenAI";
+    }
+
+    function getConfiguredProvidersFromHealth(data) {
+      const configured = [];
+      if (String(data?.openai_api_key || "").trim()) configured.push("openai");
+      if (String(data?.anthropic_api_key || "").trim()) configured.push("anthropic");
+      if (String(data?.google_api_key || "").trim()) configured.push("google");
+      return configured;
+    }
+
+    function renderModelOptions(preferredModel, healthData) {
+      const configuredProviders = getConfiguredProvidersFromHealth(healthData);
+      const providerPool = configuredProviders.length ? configuredProviders : ["openai"];
+      modelSelect.innerHTML = "";
+
+      const flatModels = [];
+      for (const provider of providerPool) {
+        const models = MODEL_CATALOG[provider] || [];
+        for (const m of models) {
+          flatModels.push({ provider, ...m });
+        }
+      }
+
+      for (const m of flatModels) {
+        const option = document.createElement("option");
+        option.value = m.id;
+        option.textContent = m.label + " (" + providerLabel(m.provider) + ")";
+        option.title = m.description || "";
+        modelSelect.appendChild(option);
+      }
+
+      if (!flatModels.length) {
+        const option = document.createElement("option");
+        option.value = preferredModel || "";
+        option.textContent = preferredModel || "No models";
+        modelSelect.appendChild(option);
+      }
+
+      const selectedModel = flatModels.some((m) => m.id === preferredModel)
+        ? preferredModel
+        : (flatModels[0]?.id || preferredModel || "");
+      modelSelect.value = selectedModel;
+    }
 
     function addMessage(text, cls) {
       const el = document.createElement("div");
@@ -788,6 +1172,134 @@ def create_app() -> Flask:
       el.textContent = text;
       chat.appendChild(el);
       chat.scrollTop = chat.scrollHeight;
+    }
+
+    function renderSessionHistory(sessionId, history) {
+      chat.innerHTML = "";
+      if (!Array.isArray(history) || history.length === 0) {
+        addMessage("No messages yet for " + sessionId + ".", "system");
+        return;
+      }
+      for (const item of history) {
+        const role = String((item || {}).role || "").trim();
+        const content = String((item || {}).content || "");
+        if (!content) continue;
+        if (role === "user") {
+          addMessage("You: " + content, "user");
+        } else if (role === "assistant") {
+          addMessage("Assistant (" + sessionId + "): " + content, "system");
+        } else {
+          addMessage(content, "system");
+        }
+      }
+    }
+
+    async function loadSessionHistory(sessionId) {
+      const safeSessionId = encodeURIComponent(sessionId);
+      const resp = await fetch("/api/sessions/" + safeSessionId);
+      const data = await resp.json();
+      if (!resp.ok) {
+        throw new Error(data.error || "failed to load session");
+      }
+      renderSessionHistory(sessionId, data.history || []);
+    }
+
+    function formatUpdatedAt(ts) {
+      if (typeof ts !== "number" || !Number.isFinite(ts)) return "";
+      const d = new Date(ts * 1000);
+      return d.toLocaleString();
+    }
+
+    function formatTs(ts) {
+      if (typeof ts !== "number" || !Number.isFinite(ts)) return "(unknown time)";
+      return new Date(ts * 1000).toLocaleString();
+    }
+
+    async function loadEvents() {
+      const resp = await fetch("/api/events");
+      const data = await resp.json();
+      if (!resp.ok) {
+        throw new Error(data.error || "failed to load events");
+      }
+      const events = Array.isArray(data.events) ? data.events : [];
+      eventsListEl.innerHTML = "";
+      if (events.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "event-item";
+        empty.textContent = "No events yet.";
+        eventsListEl.appendChild(empty);
+        return;
+      }
+      for (const event of events.slice().reverse()) {
+        const item = document.createElement("div");
+        item.className = "event-item";
+
+        const head = document.createElement("div");
+        head.className = "event-item-head";
+        const path = String((event || {}).path || "(no path)");
+        const sessionId = String((event || {}).session_id || "");
+        head.textContent = formatTs(Number((event || {}).received_at)) + " | " + path + (sessionId ? " | " + sessionId : "");
+
+        const body = document.createElement("div");
+        const payload = (event || {}).payload;
+        const rendered = String((event || {}).rendered_message || "").trim();
+        if (rendered) {
+          body.textContent = rendered;
+        } else if (payload && typeof payload === "object") {
+          body.textContent = JSON.stringify(payload);
+        } else {
+          body.textContent = JSON.stringify(event);
+        }
+
+        item.appendChild(head);
+        item.appendChild(body);
+        eventsListEl.appendChild(item);
+      }
+    }
+
+    async function loadSessions(preferredSessionId) {
+      const targetSessionId = (preferredSessionId || selectedSessionId || "local-dev").trim();
+      const resp = await fetch("/api/sessions");
+      const data = await resp.json();
+      if (!resp.ok) {
+        throw new Error(data.error || "failed to load sessions");
+      }
+      const sessions = Array.isArray(data.sessions) ? data.sessions : [];
+      sessionListEl.innerHTML = "";
+      if (sessions.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "session-item-meta";
+        empty.textContent = "No sessions yet.";
+        sessionListEl.appendChild(empty);
+        return;
+      }
+
+      for (const session of sessions) {
+        const id = String(session.session_id || "").trim();
+        if (!id) continue;
+        const item = document.createElement("button");
+        item.type = "button";
+        item.className = "session-item" + (id === targetSessionId ? " active" : "");
+        item.addEventListener("click", async () => {
+          selectedSessionId = id;
+          await loadSessionHistory(id);
+          await loadSessions(id);
+        });
+
+        const idEl = document.createElement("span");
+        idEl.className = "session-item-id";
+        idEl.textContent = id;
+
+        const metaEl = document.createElement("span");
+        metaEl.className = "session-item-meta";
+        const count = Number(session.message_count || 0);
+        const updated = formatUpdatedAt(Number(session.updated_at));
+        metaEl.textContent = count + " msgs" + (updated ? " | " + updated : "");
+
+        item.appendChild(idEl);
+        item.appendChild(metaEl);
+        sessionListEl.appendChild(item);
+      }
     }
 
     async function loadHealth() {
@@ -799,9 +1311,8 @@ def create_app() -> Flask:
           " | Forward enabled: " + data.forward_enabled +
           " | Model: " + data.model;
         forwardUrlEl.textContent = data.forward_url || "(not set)";
-        modelUrlEl.textContent = data.llm_url || "(not set)";
-        modelNameEl.textContent = data.model || "(not set)";
-        modelKeyEl.textContent = data.llm_api_key || "(not set)";
+        modelNameEl.textContent = data.default_model || data.model || "(not set)";
+        renderModelOptions(data.default_model || data.model || "", data);
         forwardKeyEl.textContent = data.forward_api_key || "(not set)";
         telegramTokenEl.textContent = data.telegram_bot_token || "(not set)";
         telegramEnabledEl.textContent = data.telegram_enabled ? "true" : "false";
@@ -812,9 +1323,8 @@ def create_app() -> Flask:
         googleKeyMaskedEl.textContent = data.google_api_key || "(not set)";
       } catch (err) {
         statusEl.textContent = "Health check failed: " + err;
-        modelUrlEl.textContent = "(health failed)";
         modelNameEl.textContent = "(health failed)";
-        modelKeyEl.textContent = "(health failed)";
+        modelSelect.innerHTML = "";
         forwardUrlEl.textContent = "(health failed)";
         forwardKeyEl.textContent = "(health failed)";
         telegramTokenEl.textContent = "(health failed)";
@@ -830,7 +1340,8 @@ def create_app() -> Flask:
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
       const text = input.value.trim();
-      const sessionId = (sessionInput.value || "").trim() || "local-dev";
+      const sessionId = selectedSessionId || "local-dev";
+      selectedSessionId = sessionId;
       if (!text) return;
 
       addMessage("You: " + text, "user");
@@ -840,16 +1351,41 @@ def create_app() -> Flask:
         const resp = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ session_id: sessionId, message: text })
+          body: JSON.stringify({ session_id: sessionId, message: text, model: modelSelect.value || "" })
         });
         const data = await resp.json();
         if (resp.ok) {
-          addMessage("Assistant (" + sessionId + "): " + data.response, "system");
+          addMessage("Assistant (" + sessionId + ", " + (data.model || modelSelect.value || "model") + "): " + data.response, "system");
+          await loadSessions(sessionId);
         } else {
           addMessage("Agent error: " + JSON.stringify(data, null, 2), "error");
         }
       } catch (err) {
         addMessage("Request error: " + err, "error");
+      }
+    });
+
+    refreshSessionsBtn.addEventListener("click", async () => {
+      try {
+        await loadSessions(selectedSessionId);
+      } catch (err) {
+        addMessage("Session refresh error: " + err, "error");
+      }
+    });
+
+    newSessionBtn.addEventListener("click", async () => {
+      const newId = "session-" + Date.now();
+      selectedSessionId = newId;
+      chat.innerHTML = "";
+      addMessage("Started new session: " + newId, "system");
+      await loadSessions(newId);
+    });
+
+    refreshEventsBtn.addEventListener("click", async () => {
+      try {
+        await loadEvents();
+      } catch (err) {
+        addMessage("Events refresh error: " + err, "error");
       }
     });
 
@@ -884,6 +1420,10 @@ def create_app() -> Flask:
     });
 
     loadHealth();
+    loadSessions(selectedSessionId)
+      .then(() => loadSessionHistory(selectedSessionId))
+      .catch((err) => addMessage("Session bootstrap error: " + err, "error"));
+    loadEvents().catch((err) => addMessage("Events bootstrap error: " + err, "error"));
     addMessage("Ready. Type a message and click Send.", "system");
   </script>
 </body>
@@ -901,9 +1441,9 @@ def create_app() -> Flask:
                 "forward_enabled": forward_enabled,
                 "forward_url": forward_url,
                 "forward_api_key": _mask_secret(forward_token),
-                "llm_url": llm_url,
-                "llm_api_key": _mask_secret(llm_api_key),
-                "model": llm_model,
+                "model": default_model,
+                "default_model": default_model,
+                "available_models": [entry["id"] for entry in flat_model_catalog],
                 "openai_api_key": _mask_secret(openai_api_key),
                 "anthropic_api_key": _mask_secret(anthropic_api_key),
                 "google_api_key": _mask_secret(google_api_key),
@@ -1041,6 +1581,7 @@ def create_app() -> Flask:
         data = request.get_json(silent=True) or {}
         session_id = str(data.get("session_id", "")).strip() or "default"
         user_message = str(data.get("message", "")).strip()
+        selected_model = str(data.get("model", "")).strip() or default_model
         if not user_message:
             return jsonify({"status": "error", "error": "message is required"}), 400
 
@@ -1053,6 +1594,7 @@ def create_app() -> Flask:
             "task_description": "User chat message",
             "task_status": "active",
             "task_done": False,
+            "model": selected_model,
         }
         event_record = {
             "received_at": time.time(),
@@ -1063,7 +1605,11 @@ def create_app() -> Flask:
             "forwarded": False,
         }
         try:
-            assistant_text = _generate_chat_response(session_id=session_id, user_message=user_message)
+            assistant_text = _generate_chat_response(
+                session_id=session_id,
+                user_message=user_message,
+                selected_model=selected_model,
+            )
             state.append_session(session_id=session_id, role="assistant", content=assistant_text)
             forward_result = _forward(
                 message=assistant_text,
@@ -1076,6 +1622,7 @@ def create_app() -> Flask:
                 {
                     "status": "ok",
                     "session_id": session_id,
+                    "model": selected_model,
                     "response": assistant_text,
                     "forwarded": bool(forward_result.get("ok")),
                     "forward_result": forward_result,

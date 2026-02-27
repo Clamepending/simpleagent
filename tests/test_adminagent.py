@@ -22,8 +22,7 @@ class _MockResp:
 class AdminAgentTests(unittest.TestCase):
     def setUp(self):
         self._tmpdir = tempfile.TemporaryDirectory()
-        os.environ["ADMINAGENT_LLM_URL"] = "http://llm.test/v1/chat/completions"
-        os.environ["ADMINAGENT_LLM_API_KEY"] = "test-key-123456"
+        os.environ["OPENAI_API_KEY"] = "test-key-123456"
         os.environ["ADMINAGENT_MODEL"] = "test-model"
         os.environ["ADMINAGENT_FORWARD_ENABLED"] = "0"
         os.environ["ADMINAGENT_DB_PATH"] = os.path.join(self._tmpdir.name, "adminagent-test.db")
@@ -38,9 +37,10 @@ class AdminAgentTests(unittest.TestCase):
             "ADMINAGENT_FORWARD_ENABLED",
             "ADMINAGENT_FORWARD_URL",
             "ADMINAGENT_FORWARD_TOKEN",
-            "ADMINAGENT_LLM_URL",
-            "ADMINAGENT_LLM_API_KEY",
             "ADMINAGENT_MODEL",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GOOGLE_API_KEY",
             "ADMINAGENT_DB_PATH",
             "TELEGRAM_POLL_ENABLED",
             "TELEGRAM_BOT_TOKEN",
@@ -118,7 +118,7 @@ class AdminAgentTests(unittest.TestCase):
         resp = client.get("/health")
         self.assertEqual(resp.status_code, 200)
         data = resp.get_json()
-        self.assertEqual(data["llm_api_key"], "test...3456")
+        self.assertEqual(data["openai_api_key"], "test...3456")
         self.assertEqual(data["forward_api_key"], "forw...-key")
 
     @patch("app.requests.post")
