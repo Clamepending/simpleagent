@@ -2,6 +2,7 @@ import os
 import tempfile
 import unittest
 from unittest.mock import patch
+import subprocess
 
 
 class _MockResp:
@@ -120,6 +121,75 @@ class AdminAgentTests(unittest.TestCase):
         data = resp.get_json()
         self.assertEqual(data["openai_api_key"], "test...3456")
         self.assertEqual(data["forward_api_key"], "forw...-key")
+        self.assertTrue(data["mcp"]["enabled"])
+
+    def test_mcp_tools_lists_demo_server_tools(self):
+        app = self._make_app()
+        client = app.test_client()
+        resp = client.get("/api/mcp/tools")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertEqual(data["status"], "ok")
+        tool_names = [t["name"] for t in data["tools"]]
+        self.assertIn("demo.echo", tool_names)
+        self.assertIn("demo.time_now", tool_names)
+
+    def test_mcp_call_demo_echo(self):
+        app = self._make_app()
+        client = app.test_client()
+        resp = client.post("/api/mcp/call", json={"tool": "demo.echo", "arguments": {"text": "hi"}})
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertEqual(data["status"], "ok")
+        self.assertEqual(data["result"]["text"], "hi")
+
+    def test_tools_config_can_disable_mcp_tool(self):
+        app = self._make_app()
+        client = app.test_client()
+
+        cfg = client.post(
+            "/api/config/tools",
+            json={
+                "shell_enabled": False,
+                "mcp_enabled": True,
+                "mcp_tools": {"demo.echo": False, "demo.time_now": True},
+            },
+        )
+        self.assertEqual(cfg.status_code, 200)
+        cfg_data = cfg.get_json()
+        self.assertEqual(cfg_data["status"], "ok")
+
+        blocked = client.post("/api/mcp/call", json={"tool": "demo.echo", "arguments": {"text": "x"}})
+        self.assertEqual(blocked.status_code, 400)
+        self.assertIn("disabled", blocked.get_json()["error"])
+
+        allowed = client.post("/api/mcp/call", json={"tool": "demo.time_now", "arguments": {}})
+        self.assertEqual(allowed.status_code, 200)
+        self.assertEqual(allowed.get_json()["status"], "ok")
+
+    @patch("app.subprocess.run")
+    @patch("app.requests.post")
+    def test_chat_executes_embedded_shell_tag(self, mock_post, mock_subprocess_run):
+        os.environ["ADMINAGENT_SHELL_ENABLED"] = "1"
+        mock_subprocess_run.return_value = subprocess.CompletedProcess(
+            args=["echo", "ok"],
+            returncode=0,
+            stdout="ok\n",
+            stderr="",
+        )
+        mock_post.side_effect = [
+            _MockResp(data={"choices": [{"message": {"content": "Let me check.\n<tool:shell>echo ok</tool:shell>"}}]}),
+            _MockResp(data={"choices": [{"message": {"content": "It worked. Shell returned ok."}}]}),
+        ]
+        app = self._make_app()
+        client = app.test_client()
+        resp = client.post("/api/chat", json={"session_id": "s-shell", "message": "did it work"})
+        self.assertEqual(resp.status_code, 200)
+        payload = resp.get_json()
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["response"], "It worked. Shell returned ok.")
+        self.assertEqual(mock_post.call_count, 2)
+        self.assertEqual(mock_subprocess_run.call_count, 1)
 
     @patch("app.requests.post")
     def test_session_history_persists_across_app_instances(self, mock_post):
@@ -138,6 +208,30 @@ class AdminAgentTests(unittest.TestCase):
         self.assertEqual(hist["status"], "ok")
         self.assertEqual([m["role"] for m in hist["history"]], ["user", "assistant"])
         self.assertEqual(hist["history"][1]["content"], "Persistent reply")
+
+    @patch("app.requests.post")
+    def test_can_delete_session(self, mock_post):
+        mock_post.return_value = _MockResp(
+            data={"choices": [{"message": {"content": "Delete me"}}]},
+        )
+        app = self._make_app()
+        client = app.test_client()
+
+        resp = client.post("/api/chat", json={"session_id": "s-delete", "message": "hello"})
+        self.assertEqual(resp.status_code, 200)
+
+        before = client.get("/api/sessions/s-delete").get_json()
+        self.assertEqual(len(before["history"]), 2)
+
+        deleted = client.delete("/api/sessions/s-delete")
+        self.assertEqual(deleted.status_code, 200)
+        deleted_payload = deleted.get_json()
+        self.assertEqual(deleted_payload["status"], "ok")
+        self.assertGreaterEqual(deleted_payload["deleted_messages"], 1)
+
+        after = client.get("/api/sessions/s-delete").get_json()
+        self.assertEqual(after["status"], "ok")
+        self.assertEqual(after["history"], [])
 
 
 if __name__ == "__main__":

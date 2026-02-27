@@ -104,6 +104,9 @@ class AppState:
     def list_sessions(self) -> List[Dict[str, Any]]:
         return self.session_store.list_sessions()
 
+    def delete_session(self, session_id: str) -> int:
+        return self.session_store.delete_session(session_id=session_id)
+
     def snapshot(self) -> Dict[str, Any]:
         sessions_snapshot = self.session_store.snapshot()
         with self.lock:
@@ -214,6 +217,15 @@ class SqliteSessionStore:
             for row in rows
         ]
 
+    def delete_session(self, session_id: str) -> int:
+        with self.lock, self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM session_messages WHERE session_id = ?",
+                (session_id,),
+            )
+            conn.commit()
+            return int(cur.rowcount or 0)
+
     def snapshot(self) -> Dict[str, Any]:
         with self.lock, self._connect() as conn:
             count_row = conn.execute(
@@ -226,6 +238,239 @@ class SqliteSessionStore:
             "session_count": int((count_row or {"session_count": 0})["session_count"]),
             "session_ids": [row["session_id"] for row in id_rows],
         }
+
+
+class DemoMcpServer:
+    def list_tools(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "name": "echo",
+                "description": "Echoes text back to the caller.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}},
+                },
+            },
+            {
+                "name": "time_now",
+                "description": "Returns current server time in seconds since epoch.",
+                "inputSchema": {"type": "object", "properties": {}},
+            },
+        ]
+
+    def call_tool(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        if name == "echo":
+            return {"ok": True, "text": str(arguments.get("text", ""))}
+        if name == "time_now":
+            return {"ok": True, "ts": time.time()}
+        raise RuntimeError(f"Unknown demo tool: {name}")
+
+    def health(self) -> Dict[str, Any]:
+        return {"status": "ok", "transport": "inproc-demo"}
+
+
+class StdioMcpClient:
+    def __init__(self, server_id: str, command: str, args: List[str], timeout_s: int):
+        self.server_id = server_id
+        self.command = command
+        self.args = args
+        self.timeout_s = timeout_s
+        self.lock = threading.Lock()
+        self.proc: Optional[subprocess.Popen] = None
+        self.request_id = 0
+        self.initialized = False
+
+    def _start(self) -> None:
+        if self.proc and self.proc.poll() is None:
+            return
+        self.proc = subprocess.Popen(
+            [self.command, *self.args],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.initialized = False
+
+    def _write_message(self, payload: Dict[str, Any]) -> None:
+        if not self.proc or not self.proc.stdin:
+            raise RuntimeError(f"MCP server {self.server_id} is not running")
+        body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
+        header = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+        self.proc.stdin.write(header + body)
+        self.proc.stdin.flush()
+
+    def _read_message(self) -> Dict[str, Any]:
+        if not self.proc or not self.proc.stdout:
+            raise RuntimeError(f"MCP server {self.server_id} is not running")
+
+        headers: Dict[str, str] = {}
+        while True:
+            line = self.proc.stdout.readline()
+            if not line:
+                raise RuntimeError(f"MCP server {self.server_id} closed stdout")
+            text = line.decode("ascii", errors="ignore").strip()
+            if not text:
+                break
+            if ":" in text:
+                k, v = text.split(":", 1)
+                headers[k.strip().lower()] = v.strip()
+
+        length = int(headers.get("content-length", "0"))
+        if length <= 0:
+            raise RuntimeError(f"MCP server {self.server_id} returned invalid content-length")
+        body = self.proc.stdout.read(length)
+        if not body:
+            raise RuntimeError(f"MCP server {self.server_id} returned empty response body")
+        data = json.loads(body.decode("utf-8"))
+        if not isinstance(data, dict):
+            raise RuntimeError(f"MCP server {self.server_id} returned invalid JSON-RPC payload")
+        return data
+
+    def _request(self, method: str, params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        self._start()
+        self.request_id += 1
+        req_id = self.request_id
+        payload: Dict[str, Any] = {"jsonrpc": "2.0", "id": req_id, "method": method}
+        if params is not None:
+            payload["params"] = params
+        self._write_message(payload)
+        started = time.time()
+        while True:
+            if time.time() - started > self.timeout_s:
+                raise RuntimeError(f"MCP request timed out for {self.server_id}:{method}")
+            msg = self._read_message()
+            if msg.get("id") != req_id:
+                continue
+            if msg.get("error"):
+                raise RuntimeError(f"MCP {self.server_id}:{method} error: {json.dumps(msg['error'])}")
+            return msg
+
+    def _ensure_initialized(self) -> None:
+        if self.initialized:
+            return
+        result = self._request(
+            "initialize",
+            {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "adminagent", "version": "0.1.0"},
+            },
+        )
+        if "result" not in result:
+            raise RuntimeError(f"MCP initialize failed for {self.server_id}")
+        self._write_message({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        self.initialized = True
+
+    def list_tools(self) -> List[Dict[str, Any]]:
+        with self.lock:
+            self._ensure_initialized()
+            result = self._request("tools/list", {})
+            tools = (result.get("result") or {}).get("tools") or []
+            return tools if isinstance(tools, list) else []
+
+    def call_tool(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        with self.lock:
+            self._ensure_initialized()
+            result = self._request("tools/call", {"name": name, "arguments": arguments or {}})
+            return (result.get("result") or {}) if isinstance(result, dict) else {}
+
+    def health(self) -> Dict[str, Any]:
+        with self.lock:
+            if self.proc and self.proc.poll() is None:
+                return {"status": "ok", "transport": "stdio"}
+            return {"status": "idle", "transport": "stdio"}
+
+
+class McpBroker:
+    def __init__(self, enabled: bool, timeout_s: int, servers_json: str):
+        self.enabled = enabled
+        self.timeout_s = timeout_s
+        self.servers: Dict[str, Any] = {}
+        if self.enabled:
+            self.servers["demo"] = DemoMcpServer()
+            self._load_servers_from_json(servers_json)
+
+    def _load_servers_from_json(self, raw: str) -> None:
+        text = str(raw or "").strip()
+        if not text:
+            return
+        try:
+            data = json.loads(text)
+        except Exception:
+            return
+        if not isinstance(data, list):
+            return
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            server_id = str(item.get("id", "")).strip()
+            transport = str(item.get("transport", "stdio")).strip().lower()
+            command = str(item.get("command", "")).strip()
+            args = item.get("args") or []
+            if not server_id or transport != "stdio" or not command:
+                continue
+            safe_args = [str(a) for a in args] if isinstance(args, list) else []
+            self.servers[server_id] = StdioMcpClient(
+                server_id=server_id,
+                command=command,
+                args=safe_args,
+                timeout_s=self.timeout_s,
+            )
+
+    def list_tools(self) -> List[Dict[str, Any]]:
+        if not self.enabled:
+            return []
+        all_tools: List[Dict[str, Any]] = []
+        for server_id, client in self.servers.items():
+            try:
+                tools = client.list_tools()
+            except Exception as exc:
+                all_tools.append(
+                    {
+                        "name": f"{server_id}.__error__",
+                        "description": f"Tool listing failed: {exc}",
+                        "inputSchema": {"type": "object", "properties": {}},
+                    }
+                )
+                continue
+            for tool in tools:
+                if not isinstance(tool, dict):
+                    continue
+                tool_name = str(tool.get("name", "")).strip()
+                if not tool_name:
+                    continue
+                all_tools.append(
+                    {
+                        "name": f"{server_id}.{tool_name}",
+                        "description": str(tool.get("description", "")).strip(),
+                        "inputSchema": tool.get("inputSchema") if isinstance(tool.get("inputSchema"), dict) else {},
+                    }
+                )
+        return all_tools
+
+    def call_tool(self, full_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        if not self.enabled:
+            raise RuntimeError("MCP is disabled")
+        name = str(full_name or "").strip()
+        if "." not in name:
+            raise RuntimeError("MCP tool name must be in 'server.tool' format")
+        server_id, tool_name = name.split(".", 1)
+        server = self.servers.get(server_id)
+        if server is None:
+            raise RuntimeError(f"MCP server '{server_id}' is not configured")
+        return server.call_tool(tool_name, arguments or {})
+
+    def health(self) -> Dict[str, Any]:
+        if not self.enabled:
+            return {"enabled": False, "servers": []}
+        result: List[Dict[str, Any]] = []
+        for server_id, client in self.servers.items():
+            try:
+                info = client.health()
+            except Exception as exc:
+                info = {"status": "error", "error": str(exc)}
+            result.append({"id": server_id, **info})
+        return {"enabled": True, "servers": result}
 
 
 def create_app() -> Flask:
@@ -255,6 +500,10 @@ def create_app() -> Flask:
     shell_timeout_s = max(1, int(os.getenv("ADMINAGENT_SHELL_TIMEOUT_S", "20")))
     shell_max_output_chars = max(200, int(os.getenv("ADMINAGENT_SHELL_MAX_OUTPUT_CHARS", "8000")))
     shell_max_calls_per_turn = max(1, int(os.getenv("ADMINAGENT_SHELL_MAX_CALLS_PER_TURN", "3")))
+    mcp_enabled = _env_bool("ADMINAGENT_MCP_ENABLED", True)
+    mcp_timeout_s = max(1, int(os.getenv("ADMINAGENT_MCP_TIMEOUT_S", "20")))
+    mcp_servers_json = os.getenv("ADMINAGENT_MCP_SERVERS_JSON", "[]")
+    mcp_disabled_tools_raw = os.getenv("ADMINAGENT_MCP_DISABLED_TOOLS", "").strip()
     telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     telegram_poll_enabled = _env_bool("TELEGRAM_POLL_ENABLED", True)
     telegram_poll_timeout_s = max(1, min(50, int(os.getenv("TELEGRAM_POLL_TIMEOUT_S", "25"))))
@@ -299,6 +548,32 @@ def create_app() -> Flask:
         return flat
 
     flat_model_catalog = _flatten_model_catalog()
+    # Runtime-configurable tool flags controlled from the UI.
+    shell_enabled_runtime = shell_enabled
+    mcp_enabled_runtime = mcp_enabled
+    mcp_disabled_tools: set[str] = {
+        t.strip()
+        for t in mcp_disabled_tools_raw.split(",")
+        if t.strip()
+    }
+
+    # Keep broker initialized so toggling MCP on/off from UI does not require restart.
+    mcp_broker = McpBroker(enabled=True, timeout_s=mcp_timeout_s, servers_json=mcp_servers_json)
+
+    def _get_all_mcp_tools() -> List[Dict[str, Any]]:
+        try:
+            return mcp_broker.list_tools()
+        except Exception:
+            return []
+
+    def _get_active_mcp_tools() -> List[Dict[str, Any]]:
+        if not mcp_enabled_runtime:
+            return []
+        return [
+            tool
+            for tool in _get_all_mcp_tools()
+            if str(tool.get("name", "")).strip() not in mcp_disabled_tools
+        ]
 
     shell_resolved_cwd = os.path.abspath(shell_cwd)
     if not os.path.isdir(shell_resolved_cwd):
@@ -362,7 +637,8 @@ def create_app() -> Flask:
     def _build_llm_messages(session_id: str, user_message: str) -> List[Dict[str, str]]:
         history = state.get_session(session_id)[-20:]
         effective_system_prompt = llm_system_prompt
-        if shell_enabled:
+        mcp_tools = _get_active_mcp_tools()
+        if shell_enabled_runtime:
             effective_system_prompt = (
                 f"{llm_system_prompt}\n\n"
                 "You can request shell access when needed by responding with exactly one line in this format:\n"
@@ -373,6 +649,25 @@ def create_app() -> Flask:
                 "- After tool output is returned to you, provide a normal user-facing answer.\n"
                 "- Do not wrap the tool line in markdown."
             )
+        if mcp_tools:
+            tool_lines = []
+            for tool in mcp_tools[:40]:
+                tool_name = str(tool.get("name", "")).strip()
+                if not tool_name:
+                    continue
+                desc = str(tool.get("description", "")).strip()
+                if desc:
+                    tool_lines.append(f"- {tool_name}: {desc}")
+                else:
+                    tool_lines.append(f"- {tool_name}")
+            if tool_lines:
+                effective_system_prompt = (
+                    f"{effective_system_prompt}\n\n"
+                    "You can request MCP tools with exactly one line in this format:\n"
+                    "<tool:mcp name=\"server.tool\">{\"arg\":\"value\"}</tool:mcp>\n"
+                    "Available MCP tools:\n"
+                    + "\n".join(tool_lines)
+                )
         messages: List[Dict[str, str]] = [{"role": "system", "content": effective_system_prompt}]
         for item in history:
             role = str(item.get("role", "")).strip()
@@ -383,11 +678,29 @@ def create_app() -> Flask:
         return messages
 
     def _extract_shell_command(text: str) -> Optional[str]:
-        match = re.fullmatch(r"\s*<tool:shell>(.+?)</tool:shell>\s*", text, flags=re.DOTALL)
+        match = re.search(r"<tool:shell>(.+?)</tool:shell>", text, flags=re.DOTALL)
         if not match:
             return None
         command = match.group(1).strip()
         return command or None
+
+    def _extract_mcp_tool_call(text: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+        match = re.search(
+            r'<tool:mcp\s+name="([^"]+)">\s*(.*?)\s*</tool:mcp>',
+            text,
+            flags=re.DOTALL,
+        )
+        if not match:
+            return None
+        tool_name = match.group(1).strip()
+        args_text = match.group(2).strip() or "{}"
+        try:
+            args_obj = json.loads(args_text)
+        except Exception as exc:
+            raise RuntimeError(f"Invalid MCP tool arguments JSON: {exc}") from exc
+        if not isinstance(args_obj, dict):
+            raise RuntimeError("MCP tool arguments must be a JSON object")
+        return tool_name, args_obj
 
     def _run_shell(command: str) -> Dict[str, Any]:
         started = time.time()
@@ -577,10 +890,33 @@ def create_app() -> Flask:
         messages = _build_llm_messages(session_id=session_id, user_message=user_message)
         for _ in range(shell_max_calls_per_turn + 1):
             assistant_text = _call_llm(messages=messages, selected_model=selected_model)
+            try:
+                mcp_call = _extract_mcp_tool_call(assistant_text)
+            except Exception as exc:
+                return str(exc)
+            if mcp_call is not None:
+                tool_name, args = mcp_call
+                if not mcp_enabled_runtime:
+                    return "MCP access is disabled by configuration."
+                if tool_name in mcp_disabled_tools:
+                    return f"MCP tool '{tool_name}' is disabled by configuration."
+                mcp_result = mcp_broker.call_tool(full_name=tool_name, arguments=args)
+                messages.append({"role": "assistant", "content": assistant_text})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "TOOL_RESULT mcp\n"
+                            f"{json.dumps({'tool': tool_name, 'result': mcp_result}, ensure_ascii=True)}\n"
+                            "Now continue and answer the user directly."
+                        ),
+                    }
+                )
+                continue
             shell_command = _extract_shell_command(assistant_text)
             if not shell_command:
                 return assistant_text
-            if not shell_enabled:
+            if not shell_enabled_runtime:
                 return "Shell access is disabled by configuration."
 
             shell_result = _run_shell(shell_command)
@@ -818,6 +1154,34 @@ def create_app() -> Flask:
       cursor: pointer;
       font-size: 12px;
     }
+    .session-item-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .session-item-main {
+      flex: 1;
+      min-width: 0;
+      text-align: left;
+      border: 0;
+      background: transparent;
+      color: inherit;
+      cursor: pointer;
+      padding: 0;
+    }
+    .session-delete-btn {
+      width: 22px;
+      min-width: 22px;
+      height: 22px;
+      border-radius: 6px;
+      padding: 0;
+      border: 1px solid #7a2b3a;
+      background: #3a1520;
+      color: #ffc4cd;
+      font-size: 12px;
+      line-height: 1;
+    }
     .session-item.active {
       border-color: #3e56a8;
       background: #1d2a52;
@@ -881,6 +1245,37 @@ def create_app() -> Flask:
       border-radius: 12px;
       background: #101935;
       padding: 12px;
+    }
+    .tools-panel {
+      border: 1px solid #23315f;
+      border-radius: 12px;
+      background: #101935;
+      padding: 12px;
+    }
+    .tools-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 10px;
+      font-size: 13px;
+      color: #cbd5ff;
+    }
+    .tools-list {
+      margin-top: 10px;
+      border: 1px solid #2b3f7a;
+      border-radius: 8px;
+      padding: 8px;
+      max-height: 260px;
+      overflow-y: auto;
+      background: #0f1733;
+    }
+    .tool-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 6px;
+      font-size: 12px;
+      color: #dce5ff;
     }
     .events-head {
       display: flex;
@@ -975,6 +1370,7 @@ def create_app() -> Flask:
     <div class="tabs">
       <button id="tabChatBtn" class="tab-btn active" type="button">Chat</button>
       <button id="tabSettingsBtn" class="tab-btn" type="button">Settings</button>
+      <button id="tabToolsBtn" class="tab-btn" type="button">Tools</button>
       <button id="tabEventsBtn" class="tab-btn" type="button">Events</button>
     </div>
 
@@ -1039,6 +1435,24 @@ def create_app() -> Flask:
       </div>
     </section>
 
+    <section id="tabTools" class="tab-panel">
+      <div class="tools-panel">
+        <div class="tools-row">
+          <input id="shellEnabledToggle" type="checkbox" />
+          <label for="shellEnabledToggle">Enable shell access</label>
+        </div>
+        <div class="tools-row">
+          <input id="mcpEnabledToggle" type="checkbox" />
+          <label for="mcpEnabledToggle">Enable MCP tools</label>
+        </div>
+        <div class="meta" style="margin-top: 6px;">MCP tool allowlist:</div>
+        <div id="mcpToolList" class="tools-list"></div>
+        <div style="margin-top: 10px;">
+          <button id="saveToolsBtn" type="button">Save Tool Settings</button>
+        </div>
+      </div>
+    </section>
+
     <section id="tabEvents" class="tab-panel">
       <div class="events-panel">
         <div class="events-head">
@@ -1052,18 +1466,25 @@ def create_app() -> Flask:
   <script>
     const tabChatBtn = document.getElementById("tabChatBtn");
     const tabSettingsBtn = document.getElementById("tabSettingsBtn");
+    const tabToolsBtn = document.getElementById("tabToolsBtn");
     const tabEventsBtn = document.getElementById("tabEventsBtn");
     const tabChat = document.getElementById("tabChat");
     const tabSettings = document.getElementById("tabSettings");
+    const tabTools = document.getElementById("tabTools");
     const tabEvents = document.getElementById("tabEvents");
 
     function showTab(name) {
       tabChat.classList.toggle("active", name === "chat");
       tabSettings.classList.toggle("active", name === "settings");
+      tabTools.classList.toggle("active", name === "tools");
       tabEvents.classList.toggle("active", name === "events");
       tabChatBtn.classList.toggle("active", name === "chat");
       tabSettingsBtn.classList.toggle("active", name === "settings");
+      tabToolsBtn.classList.toggle("active", name === "tools");
       tabEventsBtn.classList.toggle("active", name === "events");
+      if (name === "tools") {
+        loadToolsConfig().catch((err) => addMessage("Tools load error: " + err, "error"));
+      }
       if (name === "events") {
         loadEvents().catch((err) => addMessage("Events load error: " + err, "error"));
       }
@@ -1071,6 +1492,7 @@ def create_app() -> Flask:
 
     tabChatBtn.addEventListener("click", () => showTab("chat"));
     tabSettingsBtn.addEventListener("click", () => showTab("settings"));
+    tabToolsBtn.addEventListener("click", () => showTab("tools"));
     tabEventsBtn.addEventListener("click", () => showTab("events"));
 
     const chat = document.getElementById("chat");
@@ -1086,6 +1508,10 @@ def create_app() -> Flask:
     const openaiKeyMaskedEl = document.getElementById("openaiKeyMasked");
     const anthropicKeyMaskedEl = document.getElementById("anthropicKeyMasked");
     const googleKeyMaskedEl = document.getElementById("googleKeyMasked");
+    const shellEnabledToggle = document.getElementById("shellEnabledToggle");
+    const mcpEnabledToggle = document.getElementById("mcpEnabledToggle");
+    const mcpToolList = document.getElementById("mcpToolList");
+    const saveToolsBtn = document.getElementById("saveToolsBtn");
     const eventsListEl = document.getElementById("eventsList");
     const refreshEventsBtn = document.getElementById("refreshEventsBtn");
     const sessionListEl = document.getElementById("sessionList");
@@ -1099,6 +1525,7 @@ def create_app() -> Flask:
     const telegramTokenInput = document.getElementById("telegramTokenInput");
     const input = document.getElementById("msgInput");
     let selectedSessionId = "local-dev";
+    let lastToolsConfig = { mcp_tools: [] };
 
     const MODEL_CATALOG = {
       openai: [
@@ -1257,6 +1684,46 @@ def create_app() -> Flask:
       }
     }
 
+    function renderMcpToolList(mcpTools) {
+      mcpToolList.innerHTML = "";
+      const tools = Array.isArray(mcpTools) ? mcpTools : [];
+      if (!tools.length) {
+        const empty = document.createElement("div");
+        empty.className = "tool-item";
+        empty.textContent = "No MCP tools detected.";
+        mcpToolList.appendChild(empty);
+        return;
+      }
+      for (const tool of tools) {
+        const name = String((tool || {}).name || "").trim();
+        if (!name) continue;
+        const row = document.createElement("div");
+        row.className = "tool-item";
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.checked = !!tool.enabled;
+        cb.dataset.toolName = name;
+        const label = document.createElement("label");
+        label.textContent = name;
+        label.title = String((tool || {}).description || "");
+        row.appendChild(cb);
+        row.appendChild(label);
+        mcpToolList.appendChild(row);
+      }
+    }
+
+    async function loadToolsConfig() {
+      const resp = await fetch("/api/config/tools");
+      const data = await resp.json();
+      if (!resp.ok) {
+        throw new Error(data.error || "failed to load tools config");
+      }
+      lastToolsConfig = data;
+      shellEnabledToggle.checked = !!data.shell_enabled;
+      mcpEnabledToggle.checked = !!data.mcp_enabled;
+      renderMcpToolList(data.mcp_tools || []);
+    }
+
     async function loadSessions(preferredSessionId) {
       const targetSessionId = (preferredSessionId || selectedSessionId || "local-dev").trim();
       const resp = await fetch("/api/sessions");
@@ -1278,9 +1745,14 @@ def create_app() -> Flask:
         const id = String(session.session_id || "").trim();
         if (!id) continue;
         const item = document.createElement("button");
-        item.type = "button";
         item.className = "session-item" + (id === targetSessionId ? " active" : "");
-        item.addEventListener("click", async () => {
+        const row = document.createElement("div");
+        row.className = "session-item-row";
+
+        const main = document.createElement("button");
+        main.type = "button";
+        main.className = "session-item-main";
+        main.addEventListener("click", async () => {
           selectedSessionId = id;
           await loadSessionHistory(id);
           await loadSessions(id);
@@ -1296,8 +1768,41 @@ def create_app() -> Flask:
         const updated = formatUpdatedAt(Number(session.updated_at));
         metaEl.textContent = count + " msgs" + (updated ? " | " + updated : "");
 
-        item.appendChild(idEl);
-        item.appendChild(metaEl);
+        main.appendChild(idEl);
+        main.appendChild(metaEl);
+
+        const delBtn = document.createElement("button");
+        delBtn.type = "button";
+        delBtn.className = "session-delete-btn";
+        delBtn.title = "Delete session";
+        delBtn.setAttribute("aria-label", "Delete session " + id);
+        delBtn.textContent = "🗑";
+        delBtn.addEventListener("click", async (e) => {
+          e.stopPropagation();
+          if (!confirm("Delete session '" + id + "'?")) return;
+          try {
+            const resp = await fetch("/api/sessions/" + encodeURIComponent(id), { method: "DELETE" });
+            const data = await resp.json();
+            if (!resp.ok) {
+              throw new Error(data.error || "failed to delete session");
+            }
+            if (selectedSessionId === id) {
+              selectedSessionId = "local-dev";
+              chat.innerHTML = "";
+              addMessage("Deleted session: " + id, "system");
+            }
+            await loadSessions(selectedSessionId);
+            if (selectedSessionId && selectedSessionId !== id) {
+              await loadSessionHistory(selectedSessionId);
+            }
+          } catch (err) {
+            addMessage("Session delete error: " + err, "error");
+          }
+        });
+
+        row.appendChild(main);
+        row.appendChild(delBtn);
+        item.appendChild(row);
         sessionListEl.appendChild(item);
       }
     }
@@ -1419,7 +1924,41 @@ def create_app() -> Flask:
       }
     });
 
+    saveToolsBtn.addEventListener("click", async () => {
+      const toolMap = {};
+      const boxes = mcpToolList.querySelectorAll("input[type='checkbox'][data-tool-name]");
+      for (const box of boxes) {
+        toolMap[box.dataset.toolName] = box.checked;
+      }
+      const payload = {
+        shell_enabled: !!shellEnabledToggle.checked,
+        mcp_enabled: !!mcpEnabledToggle.checked,
+        mcp_tools: toolMap,
+      };
+      try {
+        const resp = await fetch("/api/config/tools", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+          addMessage("Tools settings error: " + JSON.stringify(data, null, 2), "error");
+          return;
+        }
+        lastToolsConfig = data;
+        addMessage("Tool settings updated.", "system");
+        shellEnabledToggle.checked = !!data.shell_enabled;
+        mcpEnabledToggle.checked = !!data.mcp_enabled;
+        renderMcpToolList(data.mcp_tools || []);
+        await loadHealth();
+      } catch (err) {
+        addMessage("Tools settings request error: " + err, "error");
+      }
+    });
+
     loadHealth();
+    loadToolsConfig().catch((err) => addMessage("Tools bootstrap error: " + err, "error"));
     loadSessions(selectedSessionId)
       .then(() => loadSessionHistory(selectedSessionId))
       .catch((err) => addMessage("Session bootstrap error: " + err, "error"));
@@ -1448,10 +1987,16 @@ def create_app() -> Flask:
                 "anthropic_api_key": _mask_secret(anthropic_api_key),
                 "google_api_key": _mask_secret(google_api_key),
                 "session_db_path": session_db_path,
-                "shell_enabled": shell_enabled,
+                "shell_enabled": shell_enabled_runtime,
                 "shell_cwd": shell_resolved_cwd,
                 "shell_timeout_s": shell_timeout_s,
                 "shell_max_calls_per_turn": shell_max_calls_per_turn,
+                "mcp": {
+                    **mcp_broker.health(),
+                    "enabled": mcp_enabled_runtime,
+                    "disabled_tools": sorted(mcp_disabled_tools),
+                    "tools": _get_all_mcp_tools(),
+                },
                 "telegram_enabled": _telegram_token_ready(),
                 "telegram_bot_token": _mask_secret(telegram_bot_token),
                 "telegram_mode": "long-polling",
@@ -1466,6 +2011,88 @@ def create_app() -> Flask:
     @app.route("/api/events", methods=["GET"])
     def events():
         return jsonify({"status": "ok", **state.snapshot()})
+
+    @app.route("/api/mcp/tools", methods=["GET"])
+    def mcp_tools():
+        tools = _get_all_mcp_tools()
+        tools_with_flags = []
+        for tool in tools:
+            name = str(tool.get("name", "")).strip()
+            tools_with_flags.append({**tool, "enabled": bool(name and name not in mcp_disabled_tools)})
+        return jsonify({"status": "ok", "enabled": mcp_enabled_runtime, "tools": tools_with_flags})
+
+    @app.route("/api/mcp/call", methods=["POST"])
+    def mcp_call():
+        data = request.get_json(silent=True) or {}
+        tool = str(data.get("tool", "")).strip()
+        arguments = data.get("arguments") if isinstance(data.get("arguments"), dict) else {}
+        if not tool:
+            return jsonify({"status": "error", "error": "tool is required"}), 400
+        if not mcp_enabled_runtime:
+            return jsonify({"status": "error", "error": "MCP is disabled"}), 400
+        if tool in mcp_disabled_tools:
+            return jsonify({"status": "error", "error": f"MCP tool '{tool}' is disabled"}), 400
+        try:
+            result = mcp_broker.call_tool(full_name=tool, arguments=arguments)
+            return jsonify({"status": "ok", "tool": tool, "result": result})
+        except Exception as exc:
+            return jsonify({"status": "error", "error": str(exc), "tool": tool}), 502
+
+    @app.route("/api/config/tools", methods=["GET"])
+    def get_tools_config():
+        tools = _get_all_mcp_tools()
+        return jsonify(
+            {
+                "status": "ok",
+                "shell_enabled": shell_enabled_runtime,
+                "mcp_enabled": mcp_enabled_runtime,
+                "mcp_tools": [
+                    {
+                        "name": str(tool.get("name", "")).strip(),
+                        "description": str(tool.get("description", "")).strip(),
+                        "enabled": str(tool.get("name", "")).strip() not in mcp_disabled_tools,
+                    }
+                    for tool in tools
+                    if str(tool.get("name", "")).strip()
+                ],
+            }
+        )
+
+    @app.route("/api/config/tools", methods=["POST"])
+    def update_tools_config():
+        nonlocal shell_enabled_runtime, mcp_enabled_runtime, mcp_disabled_tools
+        data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict):
+            return jsonify({"status": "error", "error": "JSON body is required"}), 400
+
+        if "shell_enabled" in data:
+            shell_enabled_runtime = bool(data.get("shell_enabled"))
+            os.environ["ADMINAGENT_SHELL_ENABLED"] = "1" if shell_enabled_runtime else "0"
+            _upsert_env_var(".env", "ADMINAGENT_SHELL_ENABLED", "1" if shell_enabled_runtime else "0")
+
+        if "mcp_enabled" in data:
+            mcp_enabled_runtime = bool(data.get("mcp_enabled"))
+            os.environ["ADMINAGENT_MCP_ENABLED"] = "1" if mcp_enabled_runtime else "0"
+            _upsert_env_var(".env", "ADMINAGENT_MCP_ENABLED", "1" if mcp_enabled_runtime else "0")
+
+        if "mcp_tools" in data:
+            tool_map = data.get("mcp_tools")
+            all_names = {
+                str(tool.get("name", "")).strip()
+                for tool in _get_all_mcp_tools()
+                if str(tool.get("name", "")).strip()
+            }
+            next_disabled: set[str] = set()
+            if isinstance(tool_map, dict):
+                for name in all_names:
+                    if name in tool_map and not bool(tool_map.get(name)):
+                        next_disabled.add(name)
+            mcp_disabled_tools = next_disabled
+            disabled_csv = ",".join(sorted(mcp_disabled_tools))
+            os.environ["ADMINAGENT_MCP_DISABLED_TOOLS"] = disabled_csv
+            _upsert_env_var(".env", "ADMINAGENT_MCP_DISABLED_TOOLS", disabled_csv)
+
+        return get_tools_config()
 
     @app.route("/hooks/videomemory-alert", methods=["POST"])
     def videomemory_hook():
@@ -1506,6 +2133,14 @@ def create_app() -> Flask:
         if not session_id:
             return jsonify({"status": "error", "error": "session_id is required"}), 400
         return jsonify({"status": "ok", "session_id": session_id, "history": state.get_session(session_id)})
+
+    @app.route("/api/sessions/<session_id>", methods=["DELETE"])
+    def delete_session(session_id: str):
+        session_id = session_id.strip()
+        if not session_id:
+            return jsonify({"status": "error", "error": "session_id is required"}), 400
+        deleted = state.delete_session(session_id=session_id)
+        return jsonify({"status": "ok", "session_id": session_id, "deleted_messages": deleted})
 
     @app.route("/api/sessions", methods=["GET"])
     def list_sessions():
