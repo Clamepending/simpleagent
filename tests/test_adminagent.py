@@ -224,6 +224,32 @@ class AdminAgentTests(unittest.TestCase):
         self.assertIn("blocked for local or private hosts", payload["error"])
 
     @patch("app.requests.post")
+    def test_chat_web_fetch_blocks_private_ip(self, mock_post):
+        mock_post.return_value = _MockResp(
+            data={"choices": [{"message": {"content": "<tool:web_fetch>http://10.0.0.8/status</tool:web_fetch>"}}]},
+        )
+        app = self._make_app()
+        client = app.test_client()
+        resp = client.post("/api/chat", json={"session_id": "s-web-private", "message": "fetch private"})
+        self.assertEqual(resp.status_code, 502)
+        payload = resp.get_json()
+        self.assertEqual(payload["status"], "error")
+        self.assertIn("blocked for local or private hosts", payload["error"])
+
+    @patch("app.requests.post")
+    def test_chat_web_fetch_rejects_non_http_scheme(self, mock_post):
+        mock_post.return_value = _MockResp(
+            data={"choices": [{"message": {"content": "<tool:web_fetch>ftp://example.com/file</tool:web_fetch>"}}]},
+        )
+        app = self._make_app()
+        client = app.test_client()
+        resp = client.post("/api/chat", json={"session_id": "s-web-scheme", "message": "fetch ftp"})
+        self.assertEqual(resp.status_code, 502)
+        payload = resp.get_json()
+        self.assertEqual(payload["status"], "error")
+        self.assertIn("must use http or https", payload["error"])
+
+    @patch("app.requests.post")
     def test_chat_web_tool_respects_disabled_toggle(self, mock_post):
         app = self._make_app()
         client = app.test_client()
@@ -260,6 +286,51 @@ class AdminAgentTests(unittest.TestCase):
         resp = client.post("/api/chat", json={"session_id": "s-web-ddg", "message": "docker docs"})
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.get_json()["status"], "ok")
+
+    @patch("app.requests.get")
+    @patch("app.requests.post")
+    def test_web_fetch_converts_html_to_markdown(self, mock_post, mock_get):
+        mock_post.side_effect = [
+            _MockResp(data={"choices": [{"message": {"content": "<tool:web_fetch>https://example.com/doc</tool:web_fetch>"}}]}),
+            _MockResp(data={"choices": [{"message": {"content": "Fetched"}}]}),
+        ]
+        mock_get.return_value = _MockResp(
+            text=(
+                "<html><head><title>Doc</title></head>"
+                "<body><h1>Guide</h1><p>See <a href=\"https://example.com/x\">details</a>.</p></body></html>"
+            ),
+            headers={"Content-Type": "text/html"},
+            url="https://example.com/doc",
+        )
+        app = self._make_app()
+        client = app.test_client()
+        resp = client.post("/api/chat", json={"session_id": "s-web-fetch", "message": "fetch it"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["status"], "ok")
+        self.assertEqual(mock_post.call_count, 2)
+        tool_result_payload = mock_post.call_args_list[1].kwargs["json"]["messages"][-1]["content"]
+        self.assertIn("# Guide", tool_result_payload)
+        self.assertIn("[details](https://example.com/x)", tool_result_payload)
+
+    @patch("app.requests.get")
+    @patch("app.requests.post")
+    def test_web_fetch_keeps_plain_text_content(self, mock_post, mock_get):
+        mock_post.side_effect = [
+            _MockResp(data={"choices": [{"message": {"content": "<tool:web_fetch>https://example.com/raw</tool:web_fetch>"}}]}),
+            _MockResp(data={"choices": [{"message": {"content": "Fetched raw"}}]}),
+        ]
+        mock_get.return_value = _MockResp(
+            text="line1\nline2",
+            headers={"Content-Type": "text/plain"},
+            url="https://example.com/raw",
+        )
+        app = self._make_app()
+        client = app.test_client()
+        resp = client.post("/api/chat", json={"session_id": "s-web-raw", "message": "fetch raw"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["status"], "ok")
+        tool_result_payload = mock_post.call_args_list[1].kwargs["json"]["messages"][-1]["content"]
+        self.assertIn("line1\\nline2", tool_result_payload)
 
     @patch("app.subprocess.run")
     @patch("app.requests.post")

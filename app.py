@@ -911,12 +911,40 @@ def create_app() -> Flask:
                 break
         return {"query": q, "results": results, "source": "duckduckgo_html"}
 
-    def _html_to_text(html: str) -> str:
-        text = re.sub(r"<(script|style|noscript)[^>]*>.*?</\1>", " ", html, flags=re.IGNORECASE | re.DOTALL)
-        text = re.sub(r"</?(p|div|br|li|ul|ol|h1|h2|h3|h4|h5|h6|article|section)[^>]*>", "\n", text, flags=re.IGNORECASE)
+    def _html_to_markdown(html: str) -> str:
+        text = html or ""
+        text = re.sub(r"<(script|style|noscript)[^>]*>.*?</\1>", " ", text, flags=re.IGNORECASE | re.DOTALL)
+
+        # Convert links early so anchor text survives later stripping.
+        text = re.sub(
+            r'<a[^>]*href=[\'"]([^\'"]+)[\'"][^>]*>(.*?)</a>',
+            lambda m: f"[{unescape(_strip_html_tags(m.group(2))).strip() or m.group(1)}]({m.group(1).strip()})",
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+        # Basic block/structure mapping.
+        text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+        for level in range(6, 0, -1):
+            tag = f"h{level}"
+            text = re.sub(
+                rf"<{tag}[^>]*>(.*?)</{tag}>",
+                lambda m, n=level: f"\n{'#' * n} {unescape(_strip_html_tags(m.group(1))).strip()}\n",
+                text,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+        text = re.sub(
+            r"<li[^>]*>(.*?)</li>",
+            lambda m: f"\n- {unescape(_strip_html_tags(m.group(1))).strip()}",
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        text = re.sub(r"</?(p|div|section|article|ul|ol|blockquote)[^>]*>", "\n", text, flags=re.IGNORECASE)
+
         text = _strip_html_tags(text)
         text = unescape(text)
         text = re.sub(r"[ \t\r\f\v]+", " ", text)
+        text = re.sub(r"\n[ \t]+", "\n", text)
         text = re.sub(r"\n{3,}", "\n\n", text)
         return text.strip()
 
@@ -939,7 +967,7 @@ def create_app() -> Flask:
             m = re.search(r"<title[^>]*>(.*?)</title>", body, flags=re.IGNORECASE | re.DOTALL)
             if m:
                 title = unescape(_strip_html_tags(m.group(1))).strip()[:240]
-        content = _html_to_text(body) if ("html" in content_type or "<html" in body.lower()) else body.strip()
+        content = _html_to_markdown(body) if ("html" in content_type or "<html" in body.lower()) else body.strip()
         content = _truncate_text(content, web_max_chars)
         return {
             "url": final_url,

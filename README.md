@@ -69,6 +69,7 @@ For a local model on your laptop, `ADMINAGENT_LLM_URL` should also use `host.doc
 - `ADMINAGENT_SYSTEM_PROMPT` (optional system prompt)
 - `ADMINAGENT_SHELL_ENABLED` (default: `1`, enable model-requested shell commands)
 - `ADMINAGENT_WEB_ENABLED` (default: `1`, enable built-in `web_search` and `web_fetch` tools)
+- `ADMINAGENT_WEB_MAX_CHARS` (default: `6000`, max extracted Markdown chars returned by `web_fetch`)
 - `ADMINAGENT_SHELL_CWD` (default: `.`, working directory for shell commands)
 - `ADMINAGENT_SHELL_TIMEOUT_S` (default: `20`, per-command timeout in seconds)
 - `ADMINAGENT_SHELL_MAX_OUTPUT_CHARS` (default: `8000`, max chars kept from stdout/stderr)
