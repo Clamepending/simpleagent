@@ -495,7 +495,7 @@ def create_app() -> Flask:
         "ADMINAGENT_SYSTEM_PROMPT",
         "You are AdminAgent, a concise, practical operations assistant.",
     ).strip()
-    shell_enabled = _env_bool("ADMINAGENT_SHELL_ENABLED", False)
+    shell_enabled = _env_bool("ADMINAGENT_SHELL_ENABLED", True)
     shell_cwd = os.getenv("ADMINAGENT_SHELL_CWD", ".").strip() or "."
     shell_timeout_s = max(1, int(os.getenv("ADMINAGENT_SHELL_TIMEOUT_S", "20")))
     shell_max_output_chars = max(200, int(os.getenv("ADMINAGENT_SHELL_MAX_OUTPUT_CHARS", "8000")))

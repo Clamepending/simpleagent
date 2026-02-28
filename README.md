@@ -66,7 +66,7 @@ For a local model on your laptop, `ADMINAGENT_LLM_URL` should also use `host.doc
 - `ADMINAGENT_DB_PATH` (default: `adminagent.db`, local SQLite file for session memory)
 - `ADMINAGENT_SESSION_MAX_MESSAGES` (default: `100`, per-session retained messages)
 - `ADMINAGENT_SYSTEM_PROMPT` (optional system prompt)
-- `ADMINAGENT_SHELL_ENABLED` (default: `0`, enable model-requested shell commands)
+- `ADMINAGENT_SHELL_ENABLED` (default: `1`, enable model-requested shell commands)
 - `ADMINAGENT_SHELL_CWD` (default: `.`, working directory for shell commands)
 - `ADMINAGENT_SHELL_TIMEOUT_S` (default: `20`, per-command timeout in seconds)
 - `ADMINAGENT_SHELL_MAX_OUTPUT_CHARS` (default: `8000`, max chars kept from stdout/stderr)
