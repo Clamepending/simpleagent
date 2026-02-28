@@ -11,6 +11,7 @@ import subprocess
 import threading
 import time
 import ipaddress
+import select
 from html import unescape
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, quote_plus, unquote, urlparse
@@ -306,61 +307,150 @@ class DemoMcpServer:
 
 
 class StdioMcpClient:
-    def __init__(self, server_id: str, command: str, args: List[str], timeout_s: int):
+    def __init__(self, server_id: str, command: str, args: List[str], timeout_s: int, env: Optional[Dict[str, str]] = None):
         self.server_id = server_id
         self.command = command
         self.args = args
         self.timeout_s = timeout_s
+        self.env = env or {}
         self.lock = threading.Lock()
         self.proc: Optional[subprocess.Popen] = None
         self.request_id = 0
         self.initialized = False
+        self.stderr_thread: Optional[threading.Thread] = None
+        self.stderr_tail: List[str] = []
+        self.stderr_tail_lock = threading.Lock()
 
     def _start(self) -> None:
         if self.proc and self.proc.poll() is None:
             return
+        merged_env = dict(os.environ)
+        merged_env.update({str(k): str(v) for k, v in self.env.items()})
         self.proc = subprocess.Popen(
             [self.command, *self.args],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=merged_env,
         )
         self.initialized = False
+        self.stderr_thread = threading.Thread(
+            target=self._drain_stderr,
+            name=f"mcp-stderr-{self.server_id}",
+            daemon=True,
+        )
+        self.stderr_thread.start()
+
+    def _drain_stderr(self) -> None:
+        if not self.proc or not self.proc.stderr:
+            return
+        try:
+            while True:
+                line = self.proc.stderr.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8", errors="replace").strip()
+                if not text:
+                    continue
+                with self.stderr_tail_lock:
+                    self.stderr_tail.append(text)
+                    self.stderr_tail = self.stderr_tail[-50:]
+        except Exception:
+            return
+
+    def _stderr_hint(self) -> str:
+        with self.stderr_tail_lock:
+            if not self.stderr_tail:
+                return ""
+            return " | stderr: " + " || ".join(self.stderr_tail[-3:])
+
+    def _readline_with_timeout(self, fd: int, deadline: float) -> bytes:
+        buf = bytearray()
+        while True:
+            now = time.time()
+            if now >= deadline:
+                raise RuntimeError(f"MCP server {self.server_id} header read timed out{self._stderr_hint()}")
+            timeout = max(0.0, deadline - now)
+            ready, _, _ = select.select([fd], [], [], timeout)
+            if not ready:
+                continue
+            chunk = os.read(fd, 1)
+            if not chunk:
+                raise RuntimeError(f"MCP server {self.server_id} closed stdout{self._stderr_hint()}")
+            buf.extend(chunk)
+            if buf.endswith(b"\n"):
+                return bytes(buf)
+
+    def _read_exact_with_timeout(self, fd: int, size: int, deadline: float) -> bytes:
+        out = bytearray()
+        while len(out) < size:
+            now = time.time()
+            if now >= deadline:
+                raise RuntimeError(f"MCP server {self.server_id} body read timed out{self._stderr_hint()}")
+            timeout = max(0.0, deadline - now)
+            ready, _, _ = select.select([fd], [], [], timeout)
+            if not ready:
+                continue
+            chunk = os.read(fd, size - len(out))
+            if not chunk:
+                raise RuntimeError(f"MCP server {self.server_id} closed stdout{self._stderr_hint()}")
+            out.extend(chunk)
+        return bytes(out)
 
     def _write_message(self, payload: Dict[str, Any]) -> None:
         if not self.proc or not self.proc.stdin:
             raise RuntimeError(f"MCP server {self.server_id} is not running")
-        body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
-        header = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
-        self.proc.stdin.write(header + body)
+        # MCP SDK stdio transport uses line-delimited JSON-RPC messages.
+        body = (json.dumps(payload, ensure_ascii=True) + "\n").encode("utf-8")
+        self.proc.stdin.write(body)
         self.proc.stdin.flush()
 
-    def _read_message(self) -> Dict[str, Any]:
+    def _read_message(self, deadline: float) -> Dict[str, Any]:
         if not self.proc or not self.proc.stdout:
             raise RuntimeError(f"MCP server {self.server_id} is not running")
-
-        headers: Dict[str, str] = {}
+        fd = self.proc.stdout.fileno()
         while True:
-            line = self.proc.stdout.readline()
-            if not line:
-                raise RuntimeError(f"MCP server {self.server_id} closed stdout")
-            text = line.decode("ascii", errors="ignore").strip()
+            line = self._readline_with_timeout(fd=fd, deadline=deadline)
+            text = line.decode("utf-8", errors="replace").strip()
             if not text:
-                break
-            if ":" in text:
-                k, v = text.split(":", 1)
-                headers[k.strip().lower()] = v.strip()
+                continue
 
-        length = int(headers.get("content-length", "0"))
-        if length <= 0:
-            raise RuntimeError(f"MCP server {self.server_id} returned invalid content-length")
-        body = self.proc.stdout.read(length)
-        if not body:
-            raise RuntimeError(f"MCP server {self.server_id} returned empty response body")
-        data = json.loads(body.decode("utf-8"))
-        if not isinstance(data, dict):
-            raise RuntimeError(f"MCP server {self.server_id} returned invalid JSON-RPC payload")
-        return data
+            # Backward-compatible fallback for Content-Length framed transports.
+            if text.lower().startswith("content-length:"):
+                headers: Dict[str, str] = {}
+                first = text
+                if ":" in first:
+                    k, v = first.split(":", 1)
+                    headers[k.strip().lower()] = v.strip()
+                while True:
+                    hline = self._readline_with_timeout(fd=fd, deadline=deadline)
+                    htxt = hline.decode("ascii", errors="ignore").strip()
+                    if not htxt:
+                        break
+                    if ":" in htxt:
+                        k, v = htxt.split(":", 1)
+                        headers[k.strip().lower()] = v.strip()
+                length = int(headers.get("content-length", "0"))
+                if length <= 0:
+                    raise RuntimeError(
+                        f"MCP server {self.server_id} returned invalid content-length{self._stderr_hint()}"
+                    )
+                body = self._read_exact_with_timeout(fd=fd, size=length, deadline=deadline)
+                if not body:
+                    raise RuntimeError(
+                        f"MCP server {self.server_id} returned empty response body{self._stderr_hint()}"
+                    )
+                data = json.loads(body.decode("utf-8"))
+            else:
+                # Primary path: newline-delimited JSON-RPC.
+                try:
+                    data = json.loads(text)
+                except Exception:
+                    continue
+
+            if not isinstance(data, dict):
+                raise RuntimeError(f"MCP server {self.server_id} returned invalid JSON-RPC payload{self._stderr_hint()}")
+            return data
 
     def _request(self, method: str, params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         self._start()
@@ -370,11 +460,11 @@ class StdioMcpClient:
         if params is not None:
             payload["params"] = params
         self._write_message(payload)
-        started = time.time()
+        deadline = time.time() + self.timeout_s
         while True:
-            if time.time() - started > self.timeout_s:
-                raise RuntimeError(f"MCP request timed out for {self.server_id}:{method}")
-            msg = self._read_message()
+            if time.time() >= deadline:
+                raise RuntimeError(f"MCP request timed out for {self.server_id}:{method}{self._stderr_hint()}")
+            msg = self._read_message(deadline=deadline)
             if msg.get("id") != req_id:
                 continue
             if msg.get("error"):
@@ -522,11 +612,16 @@ class McpBroker:
                 if not command:
                     continue
                 safe_args = [str(a) for a in args] if isinstance(args, list) else []
+                env_obj = item.get("env")
+                safe_env: Dict[str, str] = {}
+                if isinstance(env_obj, dict):
+                    safe_env = {str(k): str(v) for k, v in env_obj.items()}
                 self.servers[server_id] = StdioMcpClient(
                     server_id=server_id,
                     command=command,
                     args=safe_args,
                     timeout_s=self.timeout_s,
+                    env=safe_env,
                 )
                 continue
             if transport == "http":
