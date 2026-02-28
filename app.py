@@ -1742,7 +1742,7 @@ def create_app() -> Flask:
         const rendered = String((event || {}).rendered_message || "").trim();
         const eventError = String((event || {}).error || "").trim();
         if (eventError) {
-          body.textContent = "Error: " + eventError + (payload && typeof payload === "object" ? "\n" + JSON.stringify(payload) : "");
+          body.textContent = "Error: " + eventError + (payload && typeof payload === "object" ? "\\n" + JSON.stringify(payload) : "");
         } else if (rendered) {
           body.textContent = rendered;
         } else if (payload && typeof payload === "object") {
