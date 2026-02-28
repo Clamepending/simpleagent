@@ -6,11 +6,13 @@ import subprocess
 
 
 class _MockResp:
-    def __init__(self, status_code=200, data=None, text=""):
+    def __init__(self, status_code=200, data=None, text="", headers=None, url=""):
         self.status_code = status_code
         self._data = data or {}
         self.text = text if text else ("x" if data is not None else "")
         self.ok = status_code < 400
+        self.headers = headers or {}
+        self.url = url
 
     def json(self):
         return self._data
@@ -28,6 +30,9 @@ class AdminAgentTests(unittest.TestCase):
         os.environ["ADMINAGENT_FORWARD_ENABLED"] = "0"
         os.environ["ADMINAGENT_DB_PATH"] = os.path.join(self._tmpdir.name, "adminagent-test.db")
         os.environ["TELEGRAM_POLL_ENABLED"] = "0"
+        os.environ["ADMINAGENT_MCP_ENABLED"] = "1"
+        os.environ["ADMINAGENT_MCP_DISABLED_TOOLS"] = ""
+        os.environ["ADMINAGENT_WEB_ENABLED"] = "1"
         os.environ.pop("TELEGRAM_BOT_TOKEN", None)
         os.environ.pop("ADMINAGENT_FORWARD_URL", None)
         os.environ.pop("ADMINAGENT_FORWARD_TOKEN", None)
@@ -45,6 +50,9 @@ class AdminAgentTests(unittest.TestCase):
             "ADMINAGENT_DB_PATH",
             "TELEGRAM_POLL_ENABLED",
             "TELEGRAM_BOT_TOKEN",
+            "ADMINAGENT_MCP_ENABLED",
+            "ADMINAGENT_MCP_DISABLED_TOOLS",
+            "ADMINAGENT_WEB_ENABLED",
         ]:
             os.environ.pop(key, None)
 
@@ -166,6 +174,92 @@ class AdminAgentTests(unittest.TestCase):
         allowed = client.post("/api/mcp/call", json={"tool": "demo.time_now", "arguments": {}})
         self.assertEqual(allowed.status_code, 200)
         self.assertEqual(allowed.get_json()["status"], "ok")
+
+    def test_tools_config_can_toggle_web(self):
+        app = self._make_app()
+        client = app.test_client()
+        cfg = client.post("/api/config/tools", json={"web_enabled": False})
+        self.assertEqual(cfg.status_code, 200)
+        cfg_data = cfg.get_json()
+        self.assertEqual(cfg_data["status"], "ok")
+        self.assertFalse(cfg_data["web_enabled"])
+
+    @patch("app.requests.get")
+    @patch("app.requests.post")
+    def test_chat_executes_embedded_web_search_tag(self, mock_post, mock_get):
+        mock_post.side_effect = [
+            _MockResp(data={"choices": [{"message": {"content": "<tool:web_search>latest docker compose docs</tool:web_search>"}}]}),
+            _MockResp(data={"choices": [{"message": {"content": "I found relevant links."}}]}),
+        ]
+        mock_get.return_value = _MockResp(
+            text=(
+                '<html><body>'
+                '<a class="result__a" href="https://docs.docker.com/compose/">Docker Compose documentation</a>'
+                "</body></html>"
+            ),
+            headers={"Content-Type": "text/html"},
+            url="https://duckduckgo.com/html/",
+        )
+        app = self._make_app()
+        client = app.test_client()
+        resp = client.post("/api/chat", json={"session_id": "s-web", "message": "find compose docs"})
+        self.assertEqual(resp.status_code, 200)
+        payload = resp.get_json()
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["response"], "I found relevant links.")
+        self.assertEqual(mock_post.call_count, 2)
+        self.assertEqual(mock_get.call_count, 1)
+
+    @patch("app.requests.post")
+    def test_chat_web_fetch_blocks_localhost(self, mock_post):
+        mock_post.return_value = _MockResp(
+            data={"choices": [{"message": {"content": "<tool:web_fetch>http://localhost:3000</tool:web_fetch>"}}]},
+        )
+        app = self._make_app()
+        client = app.test_client()
+        resp = client.post("/api/chat", json={"session_id": "s-web-block", "message": "fetch local"})
+        self.assertEqual(resp.status_code, 502)
+        payload = resp.get_json()
+        self.assertEqual(payload["status"], "error")
+        self.assertIn("blocked for local or private hosts", payload["error"])
+
+    @patch("app.requests.post")
+    def test_chat_web_tool_respects_disabled_toggle(self, mock_post):
+        app = self._make_app()
+        client = app.test_client()
+        cfg = client.post("/api/config/tools", json={"web_enabled": False})
+        self.assertEqual(cfg.status_code, 200)
+
+        mock_post.return_value = _MockResp(
+            data={"choices": [{"message": {"content": "<tool:web_search>weather</tool:web_search>"}}]},
+        )
+        resp = client.post("/api/chat", json={"session_id": "s-web-off", "message": "search weather"})
+        self.assertEqual(resp.status_code, 502)
+        payload = resp.get_json()
+        self.assertEqual(payload["status"], "error")
+        self.assertIn("disabled by configuration", payload["error"])
+
+    @patch("app.requests.get")
+    @patch("app.requests.post")
+    def test_web_search_normalizes_duckduckgo_redirect_links(self, mock_post, mock_get):
+        mock_post.side_effect = [
+            _MockResp(data={"choices": [{"message": {"content": "<tool:web_search>docker docs</tool:web_search>"}}]}),
+            _MockResp(data={"choices": [{"message": {"content": "Done"}}]}),
+        ]
+        mock_get.return_value = _MockResp(
+            text=(
+                '<html><body>'
+                '<a class="result__a" href="/l/?uddg=https%3A%2F%2Fdocs.docker.com%2Fcompose%2F">Docs</a>'
+                "</body></html>"
+            ),
+            headers={"Content-Type": "text/html"},
+            url="https://duckduckgo.com/html/",
+        )
+        app = self._make_app()
+        client = app.test_client()
+        resp = client.post("/api/chat", json={"session_id": "s-web-ddg", "message": "docker docs"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["status"], "ok")
 
     @patch("app.subprocess.run")
     @patch("app.requests.post")

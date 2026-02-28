@@ -10,7 +10,10 @@ import re
 import subprocess
 import threading
 import time
+import ipaddress
+from html import unescape
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
 import requests
 from flask import Flask, jsonify, request
@@ -586,6 +589,10 @@ def create_app() -> Flask:
     shell_timeout_s = max(1, int(os.getenv("ADMINAGENT_SHELL_TIMEOUT_S", "20")))
     shell_max_output_chars = max(200, int(os.getenv("ADMINAGENT_SHELL_MAX_OUTPUT_CHARS", "8000")))
     shell_max_calls_per_turn = max(1, int(os.getenv("ADMINAGENT_SHELL_MAX_CALLS_PER_TURN", "3")))
+    web_enabled = _env_bool("ADMINAGENT_WEB_ENABLED", True)
+    web_timeout_s = max(1, int(os.getenv("ADMINAGENT_WEB_TIMEOUT_S", "12")))
+    web_max_chars = max(500, int(os.getenv("ADMINAGENT_WEB_MAX_CHARS", "6000")))
+    web_search_max_results = max(1, min(8, int(os.getenv("ADMINAGENT_WEB_SEARCH_MAX_RESULTS", "5"))))
     mcp_enabled = _env_bool("ADMINAGENT_MCP_ENABLED", True)
     mcp_timeout_s = max(1, int(os.getenv("ADMINAGENT_MCP_TIMEOUT_S", "20")))
     mcp_servers_json = os.getenv("ADMINAGENT_MCP_SERVERS_JSON", "[]")
@@ -640,6 +647,7 @@ def create_app() -> Flask:
     flat_model_catalog = _flatten_model_catalog()
     # Runtime-configurable tool flags controlled from the UI.
     shell_enabled_runtime = shell_enabled
+    web_enabled_runtime = web_enabled
     mcp_enabled_runtime = mcp_enabled
     mcp_disabled_tools: set[str] = {
         t.strip()
@@ -758,6 +766,18 @@ def create_app() -> Flask:
                     "Available MCP tools:\n"
                     + "\n".join(tool_lines)
                 )
+        if web_enabled_runtime:
+            effective_system_prompt = (
+                f"{effective_system_prompt}\n\n"
+                "You can request web tools when needed:\n"
+                "<tool:web_search>query text</tool:web_search>\n"
+                "<tool:web_fetch>https://example.com/page</tool:web_fetch>\n"
+                "Rules:\n"
+                "- Use web tools only when needed for current information.\n"
+                "- Use a full http/https URL for web_fetch.\n"
+                "- After tool output is returned, answer normally.\n"
+                "- Do not wrap the tool line in markdown."
+            )
         messages: List[Dict[str, str]] = [{"role": "system", "content": effective_system_prompt}]
         for item in history:
             role = str(item.get("role", "")).strip()
@@ -791,6 +811,143 @@ def create_app() -> Flask:
         if not isinstance(args_obj, dict):
             raise RuntimeError("MCP tool arguments must be a JSON object")
         return tool_name, args_obj
+
+    def _extract_web_search_query(text: str) -> Optional[str]:
+        match = re.search(r"<tool:web_search>(.+?)</tool:web_search>", text, flags=re.DOTALL)
+        if not match:
+            return None
+        query = match.group(1).strip()
+        return query or None
+
+    def _extract_web_fetch_url(text: str) -> Optional[str]:
+        match = re.search(r"<tool:web_fetch>(.+?)</tool:web_fetch>", text, flags=re.DOTALL)
+        if not match:
+            return None
+        url = match.group(1).strip()
+        return url or None
+
+    def _is_private_or_local_host(hostname: str) -> bool:
+        host = hostname.strip().lower().strip(".")
+        if not host:
+            return True
+        if host in {"localhost", "host.docker.internal"}:
+            return True
+        if host.endswith(".local") or host.endswith(".internal"):
+            return True
+        try:
+            ip = ipaddress.ip_address(host)
+            return bool(
+                ip.is_private
+                or ip.is_loopback
+                or ip.is_link_local
+                or ip.is_multicast
+                or ip.is_reserved
+                or ip.is_unspecified
+            )
+        except ValueError:
+            return False
+
+    def _validate_public_http_url(raw_url: str) -> str:
+        parsed = urlparse(raw_url.strip())
+        if parsed.scheme not in {"http", "https"}:
+            raise RuntimeError("web_fetch URL must use http or https")
+        if not parsed.hostname:
+            raise RuntimeError("web_fetch URL is missing hostname")
+        if _is_private_or_local_host(parsed.hostname):
+            raise RuntimeError("web_fetch blocked for local or private hosts")
+        return raw_url.strip()
+
+    def _strip_html_tags(value: str) -> str:
+        return re.sub(r"<[^>]+>", " ", value or "", flags=re.DOTALL)
+
+    def _normalize_result_url(raw_href: str) -> str:
+        href = raw_href.strip()
+        if not href:
+            return ""
+        if href.startswith("//"):
+            href = f"https:{href}"
+        if href.startswith("/l/?"):
+            parsed = urlparse(href)
+            uddg = parse_qs(parsed.query).get("uddg", [])
+            if uddg:
+                href = unquote(str(uddg[0]))
+        parsed = urlparse(href)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return ""
+        if _is_private_or_local_host(parsed.hostname):
+            return ""
+        return href
+
+    def _web_search(query: str) -> Dict[str, Any]:
+        if not web_enabled_runtime:
+            raise RuntimeError("Web tool access is disabled by configuration.")
+        q = query.strip()
+        if not q:
+            raise RuntimeError("web_search query is empty")
+        search_url = f"https://duckduckgo.com/html/?q={quote_plus(q)}"
+        resp = requests.get(
+            search_url,
+            timeout=web_timeout_s,
+            headers={"User-Agent": "adminagent/1.0"},
+        )
+        resp.raise_for_status()
+        html = resp.text or ""
+        results: List[Dict[str, str]] = []
+        seen: set[str] = set()
+        for match in re.finditer(
+            r'<a[^>]+class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+            html,
+            flags=re.IGNORECASE | re.DOTALL,
+        ):
+            url = _normalize_result_url(match.group(1))
+            if not url or url in seen:
+                continue
+            title = unescape(_strip_html_tags(match.group(2))).strip()
+            if not title:
+                title = url
+            results.append({"title": title[:240], "url": url})
+            seen.add(url)
+            if len(results) >= web_search_max_results:
+                break
+        return {"query": q, "results": results, "source": "duckduckgo_html"}
+
+    def _html_to_text(html: str) -> str:
+        text = re.sub(r"<(script|style|noscript)[^>]*>.*?</\1>", " ", html, flags=re.IGNORECASE | re.DOTALL)
+        text = re.sub(r"</?(p|div|br|li|ul|ol|h1|h2|h3|h4|h5|h6|article|section)[^>]*>", "\n", text, flags=re.IGNORECASE)
+        text = _strip_html_tags(text)
+        text = unescape(text)
+        text = re.sub(r"[ \t\r\f\v]+", " ", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+
+    def _web_fetch(raw_url: str) -> Dict[str, Any]:
+        if not web_enabled_runtime:
+            raise RuntimeError("Web tool access is disabled by configuration.")
+        url = _validate_public_http_url(raw_url)
+        resp = requests.get(
+            url,
+            timeout=web_timeout_s,
+            headers={"User-Agent": "adminagent/1.0"},
+            allow_redirects=True,
+        )
+        resp.raise_for_status()
+        final_url = _validate_public_http_url(resp.url or url)
+        content_type = str((resp.headers or {}).get("Content-Type", "")).lower()
+        body = resp.text or ""
+        title = ""
+        if "<title" in body.lower():
+            m = re.search(r"<title[^>]*>(.*?)</title>", body, flags=re.IGNORECASE | re.DOTALL)
+            if m:
+                title = unescape(_strip_html_tags(m.group(1))).strip()[:240]
+        content = _html_to_text(body) if ("html" in content_type or "<html" in body.lower()) else body.strip()
+        content = _truncate_text(content, web_max_chars)
+        return {
+            "url": final_url,
+            "status_code": int(resp.status_code),
+            "content_type": content_type or "unknown",
+            "title": title,
+            "content": content,
+        }
 
     def _run_shell(command: str) -> Dict[str, Any]:
         started = time.time()
@@ -1064,6 +1221,36 @@ def create_app() -> Flask:
                         "content": (
                             "TOOL_RESULT mcp\n"
                             f"{json.dumps({'tool': tool_name, 'result': mcp_result}, ensure_ascii=True)}\n"
+                            "Now continue and answer the user directly."
+                        ),
+                    }
+                )
+                continue
+            web_search_query = _extract_web_search_query(assistant_text)
+            if web_search_query:
+                web_result = _web_search(web_search_query)
+                messages.append({"role": "assistant", "content": assistant_text})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "TOOL_RESULT web_search\n"
+                            f"{json.dumps(web_result, ensure_ascii=True)}\n"
+                            "Now continue and answer the user directly."
+                        ),
+                    }
+                )
+                continue
+            web_fetch_url = _extract_web_fetch_url(assistant_text)
+            if web_fetch_url:
+                web_result = _web_fetch(web_fetch_url)
+                messages.append({"role": "assistant", "content": assistant_text})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "TOOL_RESULT web_fetch\n"
+                            f"{json.dumps(web_result, ensure_ascii=True)}\n"
                             "Now continue and answer the user directly."
                         ),
                     }
@@ -1598,6 +1785,10 @@ def create_app() -> Flask:
           <label for="shellEnabledToggle">Enable shell access</label>
         </div>
         <div class="tools-row">
+          <input id="webEnabledToggle" type="checkbox" />
+          <label for="webEnabledToggle">Enable web tools (search + fetch)</label>
+        </div>
+        <div class="tools-row">
           <input id="mcpEnabledToggle" type="checkbox" />
           <label for="mcpEnabledToggle">Enable MCP tools</label>
         </div>
@@ -1665,6 +1856,7 @@ def create_app() -> Flask:
     const anthropicKeyMaskedEl = document.getElementById("anthropicKeyMasked");
     const googleKeyMaskedEl = document.getElementById("googleKeyMasked");
     const shellEnabledToggle = document.getElementById("shellEnabledToggle");
+    const webEnabledToggle = document.getElementById("webEnabledToggle");
     const mcpEnabledToggle = document.getElementById("mcpEnabledToggle");
     const mcpToolList = document.getElementById("mcpToolList");
     const saveToolsBtn = document.getElementById("saveToolsBtn");
@@ -1879,6 +2071,7 @@ def create_app() -> Flask:
       }
       lastToolsConfig = data;
       shellEnabledToggle.checked = !!data.shell_enabled;
+      webEnabledToggle.checked = !!data.web_enabled;
       mcpEnabledToggle.checked = !!data.mcp_enabled;
       renderMcpToolList(data.mcp_tools || []);
     }
@@ -2091,6 +2284,7 @@ def create_app() -> Flask:
       }
       const payload = {
         shell_enabled: !!shellEnabledToggle.checked,
+        web_enabled: !!webEnabledToggle.checked,
         mcp_enabled: !!mcpEnabledToggle.checked,
         mcp_tools: toolMap,
       };
@@ -2108,6 +2302,7 @@ def create_app() -> Flask:
         lastToolsConfig = data;
         addMessage("Tool settings updated.", "system");
         shellEnabledToggle.checked = !!data.shell_enabled;
+        webEnabledToggle.checked = !!data.web_enabled;
         mcpEnabledToggle.checked = !!data.mcp_enabled;
         renderMcpToolList(data.mcp_tools || []);
         await loadHealth();
@@ -2147,6 +2342,7 @@ def create_app() -> Flask:
                 "google_api_key": _mask_secret(google_api_key),
                 "session_db_path": session_db_path,
                 "shell_enabled": shell_enabled_runtime,
+                "web_enabled": web_enabled_runtime,
                 "shell_cwd": shell_resolved_cwd,
                 "shell_timeout_s": shell_timeout_s,
                 "shell_max_calls_per_turn": shell_max_calls_per_turn,
@@ -2204,6 +2400,7 @@ def create_app() -> Flask:
             {
                 "status": "ok",
                 "shell_enabled": shell_enabled_runtime,
+                "web_enabled": web_enabled_runtime,
                 "mcp_enabled": mcp_enabled_runtime,
                 "mcp_tools": [
                     {
@@ -2219,7 +2416,7 @@ def create_app() -> Flask:
 
     @app.route("/api/config/tools", methods=["POST"])
     def update_tools_config():
-        nonlocal shell_enabled_runtime, mcp_enabled_runtime, mcp_disabled_tools
+        nonlocal shell_enabled_runtime, web_enabled_runtime, mcp_enabled_runtime, mcp_disabled_tools
         data = request.get_json(silent=True) or {}
         if not isinstance(data, dict):
             return jsonify({"status": "error", "error": "JSON body is required"}), 400
@@ -2228,6 +2425,11 @@ def create_app() -> Flask:
             shell_enabled_runtime = bool(data.get("shell_enabled"))
             os.environ["ADMINAGENT_SHELL_ENABLED"] = "1" if shell_enabled_runtime else "0"
             _upsert_env_var(".env", "ADMINAGENT_SHELL_ENABLED", "1" if shell_enabled_runtime else "0")
+
+        if "web_enabled" in data:
+            web_enabled_runtime = bool(data.get("web_enabled"))
+            os.environ["ADMINAGENT_WEB_ENABLED"] = "1" if web_enabled_runtime else "0"
+            _upsert_env_var(".env", "ADMINAGENT_WEB_ENABLED", "1" if web_enabled_runtime else "0")
 
         if "mcp_enabled" in data:
             mcp_enabled_runtime = bool(data.get("mcp_enabled"))

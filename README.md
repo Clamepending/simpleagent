@@ -21,6 +21,7 @@ GOOGLE_API_KEY=
 ADMINAGENT_LLM_API_KEY=
 ADMINAGENT_DB_PATH=./adminagent.db
 ADMINAGENT_SHELL_ENABLED=1
+ADMINAGENT_WEB_ENABLED=1
 ADMINAGENT_SHELL_CWD=.
 ADMINAGENT_SHELL_TIMEOUT_S=20
 ADMINAGENT_SHELL_MAX_OUTPUT_CHARS=8000
@@ -67,6 +68,7 @@ For a local model on your laptop, `ADMINAGENT_LLM_URL` should also use `host.doc
 - `ADMINAGENT_SESSION_MAX_MESSAGES` (default: `100`, per-session retained messages)
 - `ADMINAGENT_SYSTEM_PROMPT` (optional system prompt)
 - `ADMINAGENT_SHELL_ENABLED` (default: `1`, enable model-requested shell commands)
+- `ADMINAGENT_WEB_ENABLED` (default: `1`, enable built-in `web_search` and `web_fetch` tools)
 - `ADMINAGENT_SHELL_CWD` (default: `.`, working directory for shell commands)
 - `ADMINAGENT_SHELL_TIMEOUT_S` (default: `20`, per-command timeout in seconds)
 - `ADMINAGENT_SHELL_MAX_OUTPUT_CHARS` (default: `8000`, max chars kept from stdout/stderr)
