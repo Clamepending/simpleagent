@@ -381,6 +381,79 @@ class StdioMcpClient:
             return {"status": "idle", "transport": "stdio"}
 
 
+class HttpMcpClient:
+    def __init__(self, server_id: str, url: str, timeout_s: int):
+        self.server_id = server_id
+        self.url = url.rstrip("/")
+        self.timeout_s = timeout_s
+        self.lock = threading.Lock()
+        self.request_id = 0
+        self.initialized = False
+
+    def _request(self, method: str, params: Optional[Dict[str, Any]], expect_response: bool = True) -> Dict[str, Any]:
+        self.request_id += 1
+        req_id = self.request_id
+        payload: Dict[str, Any] = {"jsonrpc": "2.0", "id": req_id, "method": method}
+        if params is not None:
+            payload["params"] = params
+        resp = requests.post(
+            self.url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=self.timeout_s,
+        )
+        if resp.status_code >= 400:
+            detail = (resp.text or "").strip()
+            raise RuntimeError(f"MCP HTTP {self.server_id}:{method} error {resp.status_code}: {detail[:400] or 'request failed'}")
+        if not expect_response:
+            return {}
+        data = resp.json() if resp.text else {}
+        if not isinstance(data, dict):
+            raise RuntimeError(f"MCP HTTP {self.server_id}:{method} returned invalid JSON")
+        if data.get("error"):
+            raise RuntimeError(f"MCP HTTP {self.server_id}:{method} error: {json.dumps(data['error'])}")
+        return data
+
+    def _ensure_initialized(self) -> None:
+        if self.initialized:
+            return
+        result = self._request(
+            "initialize",
+            {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "adminagent", "version": "0.1.0"},
+            },
+        )
+        if "result" not in result:
+            raise RuntimeError(f"MCP initialize failed for {self.server_id}")
+        self._request("notifications/initialized", None, expect_response=False)
+        self.initialized = True
+
+    def list_tools(self) -> List[Dict[str, Any]]:
+        with self.lock:
+            self._ensure_initialized()
+            result = self._request("tools/list", {})
+            tools = (result.get("result") or {}).get("tools") or []
+            return tools if isinstance(tools, list) else []
+
+    def call_tool(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        with self.lock:
+            self._ensure_initialized()
+            result = self._request("tools/call", {"name": name, "arguments": arguments or {}})
+            return (result.get("result") or {}) if isinstance(result, dict) else {}
+
+    def health(self) -> Dict[str, Any]:
+        with self.lock:
+            try:
+                resp = requests.get(self.url.replace("/mcp", "/healthz"), timeout=min(self.timeout_s, 5))
+                if resp.status_code < 400:
+                    return {"status": "ok", "transport": "http"}
+            except Exception:
+                pass
+            return {"status": "unknown", "transport": "http"}
+
+
 class McpBroker:
     def __init__(self, enabled: bool, timeout_s: int, servers_json: str):
         self.enabled = enabled
@@ -407,15 +480,28 @@ class McpBroker:
             transport = str(item.get("transport", "stdio")).strip().lower()
             command = str(item.get("command", "")).strip()
             args = item.get("args") or []
-            if not server_id or transport != "stdio" or not command:
+            if not server_id:
                 continue
-            safe_args = [str(a) for a in args] if isinstance(args, list) else []
-            self.servers[server_id] = StdioMcpClient(
-                server_id=server_id,
-                command=command,
-                args=safe_args,
-                timeout_s=self.timeout_s,
-            )
+            if transport == "stdio":
+                if not command:
+                    continue
+                safe_args = [str(a) for a in args] if isinstance(args, list) else []
+                self.servers[server_id] = StdioMcpClient(
+                    server_id=server_id,
+                    command=command,
+                    args=safe_args,
+                    timeout_s=self.timeout_s,
+                )
+                continue
+            if transport == "http":
+                url = str(item.get("url", "")).strip()
+                if not url:
+                    continue
+                self.servers[server_id] = HttpMcpClient(
+                    server_id=server_id,
+                    url=url,
+                    timeout_s=self.timeout_s,
+                )
 
     def list_tools(self) -> List[Dict[str, Any]]:
         if not self.enabled:
