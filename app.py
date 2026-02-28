@@ -26,6 +26,39 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_str_with_legacy(name: str, default: str = "") -> str:
+    value = os.getenv(name)
+    if value is not None:
+        return value
+    legacy_name = name.replace("SIMPLEAGENT_", "ADMINAGENT_", 1)
+    legacy_value = os.getenv(legacy_name)
+    if legacy_value is not None:
+        return legacy_value
+    return default
+
+
+def _env_bool_with_legacy(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is not None:
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    legacy_name = name.replace("SIMPLEAGENT_", "ADMINAGENT_", 1)
+    legacy_value = os.getenv(legacy_name)
+    if legacy_value is not None:
+        return legacy_value.strip().lower() in {"1", "true", "yes", "on"}
+    return default
+
+
+def _env_int_with_legacy(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is not None:
+        return int(value)
+    legacy_name = name.replace("SIMPLEAGENT_", "ADMINAGENT_", 1)
+    legacy_value = os.getenv(legacy_name)
+    if legacy_value is not None:
+        return int(legacy_value)
+    return int(default)
+
+
 def _load_dotenv_file(path: str = ".env") -> None:
     if not os.path.exists(path):
         return
@@ -122,7 +155,7 @@ class AppState:
 
 class SqliteSessionStore:
     def __init__(self, db_path: str, max_messages_per_session: int = 100):
-        self.db_path = db_path.strip() or "adminagent.db"
+        self.db_path = db_path.strip() or "simpleagent.db"
         self.max_messages_per_session = max(1, int(max_messages_per_session))
         self.lock = threading.Lock()
         self._init_db()
@@ -356,7 +389,7 @@ class StdioMcpClient:
             {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
-                "clientInfo": {"name": "adminagent", "version": "0.1.0"},
+                "clientInfo": {"name": "simpleagent", "version": "0.1.0"},
             },
         )
         if "result" not in result:
@@ -425,7 +458,7 @@ class HttpMcpClient:
             {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
-                "clientInfo": {"name": "adminagent", "version": "0.1.0"},
+                "clientInfo": {"name": "simpleagent", "version": "0.1.0"},
             },
         )
         if "result" not in result:
@@ -566,8 +599,8 @@ def create_app() -> Flask:
     app = Flask(__name__)
     _load_dotenv_file()
 
-    session_db_path = os.getenv("ADMINAGENT_DB_PATH", "adminagent.db").strip() or "adminagent.db"
-    session_max_messages = int(os.getenv("ADMINAGENT_SESSION_MAX_MESSAGES", "100"))
+    session_db_path = _env_str_with_legacy("SIMPLEAGENT_DB_PATH", "simpleagent.db").strip() or "simpleagent.db"
+    session_max_messages = _env_int_with_legacy("SIMPLEAGENT_SESSION_MAX_MESSAGES", 100)
     state = AppState(
         session_store=SqliteSessionStore(
             db_path=session_db_path,
@@ -575,35 +608,36 @@ def create_app() -> Flask:
         )
     )
 
-    forward_enabled = _env_bool("ADMINAGENT_FORWARD_ENABLED", False)
-    forward_url = os.getenv("ADMINAGENT_FORWARD_URL", "").strip()
-    forward_token = os.getenv("ADMINAGENT_FORWARD_TOKEN", "").strip()
-    default_model = os.getenv("ADMINAGENT_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
-    llm_timeout_s = int(os.getenv("ADMINAGENT_LLM_TIMEOUT_S", "60"))
-    llm_system_prompt = os.getenv(
-        "ADMINAGENT_SYSTEM_PROMPT",
-        "You are AdminAgent, a concise, practical operations assistant.",
+    forward_enabled = _env_bool_with_legacy("SIMPLEAGENT_FORWARD_ENABLED", False)
+    forward_url = _env_str_with_legacy("SIMPLEAGENT_FORWARD_URL", "").strip()
+    forward_token = _env_str_with_legacy("SIMPLEAGENT_FORWARD_TOKEN", "").strip()
+    default_model = _env_str_with_legacy("SIMPLEAGENT_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
+    llm_timeout_s = _env_int_with_legacy("SIMPLEAGENT_LLM_TIMEOUT_S", 60)
+    llm_system_prompt = _env_str_with_legacy(
+        "SIMPLEAGENT_SYSTEM_PROMPT",
+        "You are SimpleAgent, a concise, practical operations assistant.",
     ).strip()
-    shell_enabled = _env_bool("ADMINAGENT_SHELL_ENABLED", True)
-    shell_cwd = os.getenv("ADMINAGENT_SHELL_CWD", ".").strip() or "."
-    shell_timeout_s = max(1, int(os.getenv("ADMINAGENT_SHELL_TIMEOUT_S", "20")))
-    shell_max_output_chars = max(200, int(os.getenv("ADMINAGENT_SHELL_MAX_OUTPUT_CHARS", "8000")))
-    shell_max_calls_per_turn = max(1, int(os.getenv("ADMINAGENT_SHELL_MAX_CALLS_PER_TURN", "3")))
-    web_enabled = _env_bool("ADMINAGENT_WEB_ENABLED", True)
-    web_timeout_s = max(1, int(os.getenv("ADMINAGENT_WEB_TIMEOUT_S", "12")))
-    web_max_chars = max(500, int(os.getenv("ADMINAGENT_WEB_MAX_CHARS", "6000")))
-    web_search_max_results = max(1, min(8, int(os.getenv("ADMINAGENT_WEB_SEARCH_MAX_RESULTS", "5"))))
-    mcp_enabled = _env_bool("ADMINAGENT_MCP_ENABLED", True)
-    mcp_timeout_s = max(1, int(os.getenv("ADMINAGENT_MCP_TIMEOUT_S", "20")))
-    mcp_servers_json = os.getenv("ADMINAGENT_MCP_SERVERS_JSON", "[]")
-    mcp_disabled_tools_raw = os.getenv("ADMINAGENT_MCP_DISABLED_TOOLS", "").strip()
+    shell_enabled = _env_bool_with_legacy("SIMPLEAGENT_SHELL_ENABLED", True)
+    shell_cwd = _env_str_with_legacy("SIMPLEAGENT_SHELL_CWD", ".").strip() or "."
+    shell_timeout_s = max(1, _env_int_with_legacy("SIMPLEAGENT_SHELL_TIMEOUT_S", 20))
+    shell_max_output_chars = max(200, _env_int_with_legacy("SIMPLEAGENT_SHELL_MAX_OUTPUT_CHARS", 8000))
+    shell_max_calls_per_turn = max(1, _env_int_with_legacy("SIMPLEAGENT_SHELL_MAX_CALLS_PER_TURN", 3))
+    web_enabled = _env_bool_with_legacy("SIMPLEAGENT_WEB_ENABLED", True)
+    web_timeout_s = max(1, _env_int_with_legacy("SIMPLEAGENT_WEB_TIMEOUT_S", 12))
+    web_max_chars = max(500, _env_int_with_legacy("SIMPLEAGENT_WEB_MAX_CHARS", 6000))
+    web_search_max_results = max(1, min(8, _env_int_with_legacy("SIMPLEAGENT_WEB_SEARCH_MAX_RESULTS", 5)))
+    mcp_enabled = _env_bool_with_legacy("SIMPLEAGENT_MCP_ENABLED", True)
+    mcp_timeout_s = max(1, _env_int_with_legacy("SIMPLEAGENT_MCP_TIMEOUT_S", 20))
+    mcp_servers_json = _env_str_with_legacy("SIMPLEAGENT_MCP_SERVERS_JSON", "[]")
+    mcp_disabled_tools_raw = _env_str_with_legacy("SIMPLEAGENT_MCP_DISABLED_TOOLS", "").strip()
+    public_base_url = _env_str_with_legacy("SIMPLEAGENT_PUBLIC_BASE_URL", "").strip().rstrip("/")
     telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     telegram_poll_enabled = _env_bool("TELEGRAM_POLL_ENABLED", True)
     telegram_poll_timeout_s = max(1, min(50, int(os.getenv("TELEGRAM_POLL_TIMEOUT_S", "25"))))
     telegram_poll_retry_s = max(1, int(os.getenv("TELEGRAM_POLL_RETRY_S", "5")))
     openai_api_key = (
         os.getenv("OPENAI_API_KEY", "").strip()
-        or os.getenv("ADMINAGENT_LLM_API_KEY", "").strip()
+        or _env_str_with_legacy("SIMPLEAGENT_LLM_API_KEY", "").strip()
     )
     anthropic_api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     google_api_key = os.getenv("GOOGLE_API_KEY", "").strip()
@@ -688,12 +722,12 @@ def create_app() -> Flask:
         if not forward_enabled:
             return {"ok": False, "message": "forwarding disabled"}
         if not forward_url:
-            raise RuntimeError("ADMINAGENT_FORWARD_URL is required when ADMINAGENT_FORWARD_ENABLED=1")
+            raise RuntimeError("SIMPLEAGENT_FORWARD_URL is required when SIMPLEAGENT_FORWARD_ENABLED=1")
 
         headers = {"Content-Type": "application/json"}
         if forward_token:
             headers["Authorization"] = f"Bearer {forward_token}"
-        body = {"source": "adminagent", "message": message, "event": payload, "received_at": time.time()}
+        body = {"source": "simpleagent", "message": message, "event": payload, "received_at": time.time()}
         resp = requests.post(forward_url, json=body, headers=headers, timeout=30)
         resp.raise_for_status()
         data = resp.json() if resp.text else {}
@@ -731,6 +765,15 @@ def create_app() -> Flask:
             },
         )
         return result if isinstance(result, list) else []
+
+    def _get_callback_url() -> str:
+        if public_base_url:
+            return f"{public_base_url}/hooks/outward_inbox"
+        host = (os.getenv("HOST", "127.0.0.1") or "127.0.0.1").strip()
+        if host in {"0.0.0.0", "::"}:
+            host = "localhost"
+        port = str(os.getenv("PORT", "18789")).strip() or "18789"
+        return f"http://{host}:{port}/hooks/outward_inbox"
 
     def _build_llm_messages(session_id: str, user_message: str) -> List[Dict[str, str]]:
         history = state.get_session(session_id)[-20:]
@@ -776,6 +819,23 @@ def create_app() -> Flask:
                 "- Use web tools only when needed for current information.\n"
                 "- Use a full http/https URL for web_fetch.\n"
                 "- After tool output is returned, answer normally.\n"
+                "- Do not wrap the tool line in markdown."
+            )
+        effective_system_prompt = (
+            f"{effective_system_prompt}\n\n"
+            "You can fetch this agent's webhook callback URL with exactly one line:\n"
+            "get_callback_url()\n"
+            "This returns the URL for external services to send events to `/hooks/outward_inbox`.\n"
+            "For OttoAuth signup/account creation flows, always call get_callback_url() before providing setup instructions."
+        )
+        if _telegram_token_ready():
+            effective_system_prompt = (
+                f"{effective_system_prompt}\n\n"
+                "You can send a Telegram message with exactly one line in this format:\n"
+                "send_telegram_messege(\"your message\")\n"
+                "Rules:\n"
+                "- Prefer this only when explicitly asked to send a Telegram message.\n"
+                "- This works automatically in Telegram sessions (session_id starts with telegram:).\n"
                 "- Do not wrap the tool line in markdown."
             )
         messages: List[Dict[str, str]] = [{"role": "system", "content": effective_system_prompt}]
@@ -825,6 +885,30 @@ def create_app() -> Flask:
             return None
         url = match.group(1).strip()
         return url or None
+
+    def _extract_telegram_send_call(text: str) -> Optional[str]:
+        match = re.search(
+            r"send_telegram_messege\s*\(\s*(.+?)\s*\)",
+            text,
+            flags=re.DOTALL,
+        )
+        if not match:
+            match = re.search(
+                r"send_telegram_message\s*\(\s*(.+?)\s*\)",
+                text,
+                flags=re.DOTALL,
+            )
+        if not match:
+            return None
+        raw = match.group(1).strip()
+        if not raw:
+            raise RuntimeError("send_telegram_messege requires a message argument")
+        if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+            return raw[1:-1]
+        return raw
+
+    def _extract_get_callback_url_call(text: str) -> bool:
+        return bool(re.search(r"\bget_callback_url\s*\(\s*\)", text))
 
     _STATEFUL_REQUEST_RE = re.compile(
         r"\b("
@@ -916,7 +1000,7 @@ def create_app() -> Flask:
         resp = requests.get(
             search_url,
             timeout=web_timeout_s,
-            headers={"User-Agent": "adminagent/1.0"},
+            headers={"User-Agent": "simpleagent/1.0"},
         )
         resp.raise_for_status()
         html = resp.text or ""
@@ -983,7 +1067,7 @@ def create_app() -> Flask:
         resp = requests.get(
             url,
             timeout=web_timeout_s,
-            headers={"User-Agent": "adminagent/1.0"},
+            headers={"User-Agent": "simpleagent/1.0"},
             allow_redirects=True,
         )
         resp.raise_for_status()
@@ -1003,6 +1087,31 @@ def create_app() -> Flask:
             "content_type": content_type or "unknown",
             "title": title,
             "content": content,
+        }
+
+    def _send_telegram_tool_message(current_session_id: str, message_text: str) -> Dict[str, Any]:
+        if not _telegram_token_ready():
+            raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured")
+        msg = str(message_text or "").strip()
+        if not msg:
+            raise RuntimeError("send_telegram_messege requires a non-empty message")
+        if not current_session_id.startswith("telegram:"):
+            raise RuntimeError(
+                "send_telegram_messege requires a Telegram session (session_id like telegram:<chat_id>)"
+            )
+        chat_id_part = current_session_id.split(":", 1)[1].strip()
+        if not chat_id_part:
+            raise RuntimeError("Invalid Telegram session id")
+        try:
+            chat_id = int(chat_id_part)
+        except ValueError as exc:
+            raise RuntimeError("Invalid Telegram chat id in session") from exc
+        sent = _telegram_send_message(chat_id=chat_id, text=msg, reply_to_message_id=None)
+        return {
+            "ok": True,
+            "chat_id": chat_id,
+            "message": msg,
+            "telegram_result": sent,
         }
 
     def _run_shell(command: str) -> Dict[str, Any]:
@@ -1315,6 +1424,41 @@ def create_app() -> Flask:
                     }
                 )
                 continue
+            if _extract_get_callback_url_call(assistant_text):
+                callback_result = {
+                    "callback_url": _get_callback_url(),
+                    "path": "/hooks/outward_inbox",
+                }
+                messages.append({"role": "assistant", "content": assistant_text})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "TOOL_RESULT get_callback_url\n"
+                            f"{json.dumps(callback_result, ensure_ascii=True)}\n"
+                            "Now continue and answer the user directly."
+                        ),
+                    }
+                )
+                continue
+            telegram_message = _extract_telegram_send_call(assistant_text)
+            if telegram_message is not None:
+                telegram_result = _send_telegram_tool_message(
+                    current_session_id=session_id,
+                    message_text=telegram_message,
+                )
+                messages.append({"role": "assistant", "content": assistant_text})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "TOOL_RESULT send_telegram_messege\n"
+                            f"{json.dumps(telegram_result, ensure_ascii=True)}\n"
+                            "Now continue and answer the user directly."
+                        ),
+                    }
+                )
+                continue
             shell_command = _extract_shell_command(assistant_text)
             if not shell_command:
                 if (
@@ -1496,7 +1640,7 @@ def create_app() -> Flask:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>AdminAgent Chat Tester</title>
+  <title>SimpleAgent Chat Tester</title>
   <style>
     :root { color-scheme: dark; }
     body {
@@ -1791,7 +1935,7 @@ def create_app() -> Flask:
 </head>
 <body>
   <div class="wrap">
-    <h1>AdminAgent Chat</h1>
+    <h1>SimpleAgent Chat</h1>
     <p class="muted">Chat via <code>/api/chat</code>. Session history is persisted locally by <code>session_id</code>.</p>
     <div id="status" class="status">Loading status...</div>
     <div class="tabs">
@@ -2414,7 +2558,7 @@ def create_app() -> Flask:
         return jsonify(
             {
                 "status": "ok",
-                "service": "adminagent",
+                "service": "simpleagent",
                 "forward_enabled": forward_enabled,
                 "forward_url": forward_url,
                 "forward_api_key": _mask_secret(forward_token),
@@ -2443,6 +2587,7 @@ def create_app() -> Flask:
                 "telegram_poll_timeout_s": telegram_poll_timeout_s,
                 "telegram_polling_active": bool(telegram_poll_enabled and _telegram_token_ready()),
                 "telegram_poll_state": poll_snapshot,
+                "outward_inbox_callback_url": _get_callback_url(),
                 "sessions": state.snapshot().get("sessions"),
             }
         )
@@ -2507,18 +2652,18 @@ def create_app() -> Flask:
 
         if "shell_enabled" in data:
             shell_enabled_runtime = bool(data.get("shell_enabled"))
-            os.environ["ADMINAGENT_SHELL_ENABLED"] = "1" if shell_enabled_runtime else "0"
-            _upsert_env_var(".env", "ADMINAGENT_SHELL_ENABLED", "1" if shell_enabled_runtime else "0")
+            os.environ["SIMPLEAGENT_SHELL_ENABLED"] = "1" if shell_enabled_runtime else "0"
+            _upsert_env_var(".env", "SIMPLEAGENT_SHELL_ENABLED", "1" if shell_enabled_runtime else "0")
 
         if "web_enabled" in data:
             web_enabled_runtime = bool(data.get("web_enabled"))
-            os.environ["ADMINAGENT_WEB_ENABLED"] = "1" if web_enabled_runtime else "0"
-            _upsert_env_var(".env", "ADMINAGENT_WEB_ENABLED", "1" if web_enabled_runtime else "0")
+            os.environ["SIMPLEAGENT_WEB_ENABLED"] = "1" if web_enabled_runtime else "0"
+            _upsert_env_var(".env", "SIMPLEAGENT_WEB_ENABLED", "1" if web_enabled_runtime else "0")
 
         if "mcp_enabled" in data:
             mcp_enabled_runtime = bool(data.get("mcp_enabled"))
-            os.environ["ADMINAGENT_MCP_ENABLED"] = "1" if mcp_enabled_runtime else "0"
-            _upsert_env_var(".env", "ADMINAGENT_MCP_ENABLED", "1" if mcp_enabled_runtime else "0")
+            os.environ["SIMPLEAGENT_MCP_ENABLED"] = "1" if mcp_enabled_runtime else "0"
+            _upsert_env_var(".env", "SIMPLEAGENT_MCP_ENABLED", "1" if mcp_enabled_runtime else "0")
 
         if "mcp_tools" in data:
             tool_map = data.get("mcp_tools")
@@ -2534,8 +2679,8 @@ def create_app() -> Flask:
                         next_disabled.add(name)
             mcp_disabled_tools = next_disabled
             disabled_csv = ",".join(sorted(mcp_disabled_tools))
-            os.environ["ADMINAGENT_MCP_DISABLED_TOOLS"] = disabled_csv
-            _upsert_env_var(".env", "ADMINAGENT_MCP_DISABLED_TOOLS", disabled_csv)
+            os.environ["SIMPLEAGENT_MCP_DISABLED_TOOLS"] = disabled_csv
+            _upsert_env_var(".env", "SIMPLEAGENT_MCP_DISABLED_TOOLS", disabled_csv)
 
         return get_tools_config()
 
@@ -2571,6 +2716,44 @@ def create_app() -> Flask:
             }
         )
         return jsonify({"status": "ok", "session_id": session_id, "recorded": True})
+
+    @app.route("/hooks/outward_inbox", methods=["POST"])
+    def outward_inbox_hook():
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            raw_text = (request.get_data(as_text=True) or "").strip()
+            payload = {"raw": _truncate_text(raw_text, 8000)} if raw_text else {}
+
+        source = str(payload.get("source", "")).strip() or "outward"
+        source_key = re.sub(r"[^a-zA-Z0-9:_-]+", "-", source).strip("-") or "outward"
+        session_id = str(payload.get("session_id", "")).strip() or f"outward:{source_key}"
+        note = (
+            str(payload.get("message", "")).strip()
+            or str(payload.get("note", "")).strip()
+            or str(payload.get("text", "")).strip()
+            or json.dumps(payload, ensure_ascii=True)
+        )
+        rendered = f"Outward inbox notification from {source}: {note}"
+
+        state.append_session(session_id=session_id, role="user", content=rendered)
+        state.record_event(
+            {
+                "received_at": time.time(),
+                "path": "/hooks/outward_inbox",
+                "session_id": session_id,
+                "payload": payload,
+                "rendered_message": rendered,
+                "forwarded": False,
+            }
+        )
+        return jsonify(
+            {
+                "status": "ok",
+                "session_id": session_id,
+                "recorded": True,
+                "message": "Notification recorded",
+            }
+        )
 
     @app.route("/api/sessions/<session_id>", methods=["GET"])
     def get_session(session_id: str):

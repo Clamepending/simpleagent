@@ -1,23 +1,24 @@
 services:
-  adminagent:
+  simpleagent:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: adminagent
+    container_name: simpleagent
     restart: unless-stopped
     environment:
       PORT: "18789"
-      ADMINAGENT_LLM_URL: "${ADMINAGENT_LLM_URL:-http://host.docker.internal:11434/v1/chat/completions}"
-      ADMINAGENT_MODEL: "${ADMINAGENT_MODEL:-llama3.2}"
+      SIMPLEAGENT_LLM_URL: "${SIMPLEAGENT_LLM_URL:-http://host.docker.internal:11434/v1/chat/completions}"
+      SIMPLEAGENT_MODEL: "${SIMPLEAGENT_MODEL:-llama3.2}"
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
       GOOGLE_API_KEY: "${GOOGLE_API_KEY:-}"
-      ADMINAGENT_LLM_API_KEY: "${ADMINAGENT_LLM_API_KEY:-}"
-      ADMINAGENT_WEB_ENABLED: "${ADMINAGENT_WEB_ENABLED:-1}"
-      ADMINAGENT_SYSTEM_PROMPT: "${ADMINAGENT_SYSTEM_PROMPT:-You are AdminAgent, a concise, practical operations assistant.}"
-      ADMINAGENT_FORWARD_ENABLED: "${ADMINAGENT_FORWARD_ENABLED:-0}"
-      ADMINAGENT_FORWARD_URL: "${ADMINAGENT_FORWARD_URL:-}"
-      ADMINAGENT_FORWARD_TOKEN: "${ADMINAGENT_FORWARD_TOKEN:-}"
+      SIMPLEAGENT_LLM_API_KEY: "${SIMPLEAGENT_LLM_API_KEY:-}"
+      SIMPLEAGENT_WEB_ENABLED: "${SIMPLEAGENT_WEB_ENABLED:-1}"
+      SIMPLEAGENT_SYSTEM_PROMPT: "${SIMPLEAGENT_SYSTEM_PROMPT:-You are SimpleAgent, a concise, practical operations assistant.}"
+      SIMPLEAGENT_FORWARD_ENABLED: "${SIMPLEAGENT_FORWARD_ENABLED:-0}"
+      SIMPLEAGENT_FORWARD_URL: "${SIMPLEAGENT_FORWARD_URL:-}"
+      SIMPLEAGENT_FORWARD_TOKEN: "${SIMPLEAGENT_FORWARD_TOKEN:-}"
+      SIMPLEAGENT_PUBLIC_BASE_URL: "${SIMPLEAGENT_PUBLIC_BASE_URL:-}"
       TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:-}"
       TELEGRAM_POLL_ENABLED: "${TELEGRAM_POLL_ENABLED:-1}"
       TELEGRAM_POLL_TIMEOUT_S: "${TELEGRAM_POLL_TIMEOUT_S:-25}"
@@ -25,4 +26,4 @@ services:
     ports:
       - "127.0.0.1:18789:18789"
     volumes:
-      - /opt/adminagent/data:/data
+      - /opt/simpleagent/data:/data

@@ -22,37 +22,38 @@ class _MockResp:
             raise RuntimeError(f"http {self.status_code}")
 
 
-class AdminAgentTests(unittest.TestCase):
+class SimpleAgentTests(unittest.TestCase):
     def setUp(self):
         self._tmpdir = tempfile.TemporaryDirectory()
         os.environ["OPENAI_API_KEY"] = "test-key-123456"
-        os.environ["ADMINAGENT_MODEL"] = "test-model"
-        os.environ["ADMINAGENT_FORWARD_ENABLED"] = "0"
-        os.environ["ADMINAGENT_DB_PATH"] = os.path.join(self._tmpdir.name, "adminagent-test.db")
+        os.environ["SIMPLEAGENT_MODEL"] = "test-model"
+        os.environ["SIMPLEAGENT_FORWARD_ENABLED"] = "0"
+        os.environ["SIMPLEAGENT_DB_PATH"] = os.path.join(self._tmpdir.name, "simpleagent-test.db")
         os.environ["TELEGRAM_POLL_ENABLED"] = "0"
-        os.environ["ADMINAGENT_MCP_ENABLED"] = "1"
-        os.environ["ADMINAGENT_MCP_DISABLED_TOOLS"] = ""
-        os.environ["ADMINAGENT_WEB_ENABLED"] = "1"
+        os.environ["SIMPLEAGENT_MCP_ENABLED"] = "1"
+        os.environ["SIMPLEAGENT_MCP_DISABLED_TOOLS"] = ""
+        os.environ["SIMPLEAGENT_WEB_ENABLED"] = "1"
         os.environ.pop("TELEGRAM_BOT_TOKEN", None)
-        os.environ.pop("ADMINAGENT_FORWARD_URL", None)
-        os.environ.pop("ADMINAGENT_FORWARD_TOKEN", None)
+        os.environ.pop("SIMPLEAGENT_FORWARD_URL", None)
+        os.environ.pop("SIMPLEAGENT_FORWARD_TOKEN", None)
 
     def tearDown(self):
         self._tmpdir.cleanup()
         for key in [
-            "ADMINAGENT_FORWARD_ENABLED",
-            "ADMINAGENT_FORWARD_URL",
-            "ADMINAGENT_FORWARD_TOKEN",
-            "ADMINAGENT_MODEL",
+            "SIMPLEAGENT_FORWARD_ENABLED",
+            "SIMPLEAGENT_FORWARD_URL",
+            "SIMPLEAGENT_FORWARD_TOKEN",
+            "SIMPLEAGENT_MODEL",
             "OPENAI_API_KEY",
             "ANTHROPIC_API_KEY",
             "GOOGLE_API_KEY",
-            "ADMINAGENT_DB_PATH",
+            "SIMPLEAGENT_DB_PATH",
             "TELEGRAM_POLL_ENABLED",
             "TELEGRAM_BOT_TOKEN",
-            "ADMINAGENT_MCP_ENABLED",
-            "ADMINAGENT_MCP_DISABLED_TOOLS",
-            "ADMINAGENT_WEB_ENABLED",
+            "SIMPLEAGENT_MCP_ENABLED",
+            "SIMPLEAGENT_MCP_DISABLED_TOOLS",
+            "SIMPLEAGENT_WEB_ENABLED",
+            "SIMPLEAGENT_PUBLIC_BASE_URL",
         ]:
             os.environ.pop(key, None)
 
@@ -69,7 +70,7 @@ class AdminAgentTests(unittest.TestCase):
         resp = client.get("/")
         self.assertEqual(resp.status_code, 200)
         body = resp.get_data(as_text=True)
-        self.assertIn("AdminAgent Chat", body)
+        self.assertIn("SimpleAgent Chat", body)
         self.assertIn("/api/chat", body)
 
     def test_chat_requires_message(self):
@@ -107,8 +108,8 @@ class AdminAgentTests(unittest.TestCase):
 
     @patch("app.requests.post")
     def test_forwards_when_enabled(self, mock_post):
-        os.environ["ADMINAGENT_FORWARD_ENABLED"] = "1"
-        os.environ["ADMINAGENT_FORWARD_URL"] = "http://example.test/hook"
+        os.environ["SIMPLEAGENT_FORWARD_ENABLED"] = "1"
+        os.environ["SIMPLEAGENT_FORWARD_URL"] = "http://example.test/hook"
         mock_post.side_effect = [
             _MockResp(data={"choices": [{"message": {"content": "Hello from model"}}]}),
             _MockResp(data={"ok": True}),
@@ -121,7 +122,7 @@ class AdminAgentTests(unittest.TestCase):
         self.assertEqual(mock_post.call_count, 2)
 
     def test_health_masks_api_keys(self):
-        os.environ["ADMINAGENT_FORWARD_TOKEN"] = "forward-secret-key"
+        os.environ["SIMPLEAGENT_FORWARD_TOKEN"] = "forward-secret-key"
         app = self._make_app()
         client = app.test_client()
         resp = client.get("/health")
@@ -332,10 +333,114 @@ class AdminAgentTests(unittest.TestCase):
         tool_result_payload = mock_post.call_args_list[1].kwargs["json"]["messages"][-1]["content"]
         self.assertIn("line1\\nline2", tool_result_payload)
 
+    @patch("app.requests.post")
+    def test_chat_executes_send_telegram_tool_in_telegram_session(self, mock_post):
+        os.environ["TELEGRAM_BOT_TOKEN"] = "123456:ABCDEF"
+        mock_post.side_effect = [
+            _MockResp(data={"choices": [{"message": {"content": "send_telegram_messege(\"hello from tool\")"}}]}),
+            _MockResp(data={"ok": True, "result": {"message_id": 9}}),
+            _MockResp(data={"choices": [{"message": {"content": "Sent to Telegram."}}]}),
+        ]
+        app = self._make_app()
+        client = app.test_client()
+        resp = client.post("/api/chat", json={"session_id": "telegram:12345", "message": "send now"})
+        self.assertEqual(resp.status_code, 200)
+        payload = resp.get_json()
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["response"], "Sent to Telegram.")
+        self.assertEqual(mock_post.call_count, 3)
+
+    @patch("app.requests.post")
+    def test_chat_send_telegram_tool_rejects_non_telegram_session(self, mock_post):
+        os.environ["TELEGRAM_BOT_TOKEN"] = "123456:ABCDEF"
+        mock_post.return_value = _MockResp(
+            data={"choices": [{"message": {"content": "send_telegram_messege(\"hello\")"}}]},
+        )
+        app = self._make_app()
+        client = app.test_client()
+        resp = client.post("/api/chat", json={"session_id": "local-dev", "message": "send now"})
+        self.assertEqual(resp.status_code, 502)
+        payload = resp.get_json()
+        self.assertEqual(payload["status"], "error")
+        self.assertIn("requires a Telegram session", payload["error"])
+
+    @patch("app.requests.post")
+    def test_chat_executes_get_callback_url_tool_call(self, mock_post):
+        os.environ["SIMPLEAGENT_PUBLIC_BASE_URL"] = "https://agent.example.com"
+        mock_post.side_effect = [
+            _MockResp(data={"choices": [{"message": {"content": "get_callback_url()"}}]}),
+            _MockResp(data={"choices": [{"message": {"content": "Use this callback URL."}}]}),
+        ]
+        app = self._make_app()
+        client = app.test_client()
+        resp = client.post("/api/chat", json={"session_id": "s-callback", "message": "what callback should I use?"})
+        self.assertEqual(resp.status_code, 200)
+        payload = resp.get_json()
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["response"], "Use this callback URL.")
+        self.assertEqual(mock_post.call_count, 2)
+        tool_result_payload = mock_post.call_args_list[1].kwargs["json"]["messages"][-1]["content"]
+        self.assertIn("TOOL_RESULT get_callback_url", tool_result_payload)
+        self.assertIn("https://agent.example.com/hooks/outward_inbox", tool_result_payload)
+
+    @patch("app.requests.post")
+    def test_system_prompt_includes_ottoauth_callback_instruction(self, mock_post):
+        mock_post.return_value = _MockResp(data={"choices": [{"message": {"content": "ok"}}]})
+        app = self._make_app()
+        client = app.test_client()
+        resp = client.post("/api/chat", json={"session_id": "s-ottoauth", "message": "help with ottoauth signup"})
+        self.assertEqual(resp.status_code, 200)
+        first_payload = mock_post.call_args_list[0].kwargs["json"]
+        messages = first_payload.get("messages") or []
+        self.assertTrue(messages)
+        system_prompt = str(messages[0].get("content", ""))
+        self.assertIn("OttoAuth signup/account creation flows", system_prompt)
+        self.assertIn("always call get_callback_url()", system_prompt)
+
+    @patch("app.requests.post")
+    def test_ottoauth_signup_flow_uses_callback_tool_result(self, mock_post):
+        os.environ["SIMPLEAGENT_PUBLIC_BASE_URL"] = "https://agent.example.com"
+        mock_post.side_effect = [
+            _MockResp(data={"choices": [{"message": {"content": "get_callback_url()"}}]}),
+            _MockResp(data={"choices": [{"message": {"content": "Use this callback for OttoAuth signup."}}]}),
+        ]
+        app = self._make_app()
+        client = app.test_client()
+        resp = client.post(
+            "/api/chat",
+            json={"session_id": "s-ottoauth-flow", "message": "create an ottoauth account signup webhook"},
+        )
+        self.assertEqual(resp.status_code, 200)
+        payload = resp.get_json()
+        self.assertEqual(payload["status"], "ok")
+        self.assertIn("OttoAuth signup", payload["response"])
+        second_payload = mock_post.call_args_list[1].kwargs["json"]
+        tool_result_msg = str((second_payload.get("messages") or [])[-1].get("content", ""))
+        self.assertIn("TOOL_RESULT get_callback_url", tool_result_msg)
+        self.assertIn("https://agent.example.com/hooks/outward_inbox", tool_result_msg)
+
+    def test_outward_inbox_hook_creates_session_notification(self):
+        app = self._make_app()
+        client = app.test_client()
+        resp = client.post(
+            "/hooks/outward_inbox",
+            json={"source": "ottoauth", "message": "account created", "event_id": "evt-1"},
+        )
+        self.assertEqual(resp.status_code, 200)
+        payload = resp.get_json()
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["session_id"], "outward:ottoauth")
+
+        hist = client.get("/api/sessions/outward:ottoauth").get_json()
+        self.assertEqual(hist["status"], "ok")
+        self.assertEqual(len(hist["history"]), 1)
+        self.assertEqual(hist["history"][0]["role"], "user")
+        self.assertIn("Outward inbox notification from ottoauth", hist["history"][0]["content"])
+
     @patch("app.subprocess.run")
     @patch("app.requests.post")
     def test_chat_executes_embedded_shell_tag(self, mock_post, mock_subprocess_run):
-        os.environ["ADMINAGENT_SHELL_ENABLED"] = "1"
+        os.environ["SIMPLEAGENT_SHELL_ENABLED"] = "1"
         mock_subprocess_run.return_value = subprocess.CompletedProcess(
             args=["echo", "ok"],
             returncode=0,

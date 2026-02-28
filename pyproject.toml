@@ -1,5 +1,5 @@
 [project]
-name = "adminagent"
+name = "simpleagent"
 version = "0.1.0"
 description = "Minimal webhook gateway for forwarding events"
 readme = "README.md"
