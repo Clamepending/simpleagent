@@ -826,6 +826,34 @@ def create_app() -> Flask:
         url = match.group(1).strip()
         return url or None
 
+    _STATEFUL_REQUEST_RE = re.compile(
+        r"\b("
+        r"create|add|remove|delete|update|edit|configure|approve|pair|connect|"
+        r"list|show|get|fetch|check|status|did you|set up|setup|start|stop"
+        r")\b",
+        flags=re.IGNORECASE,
+    )
+    _BACKEND_ENTITY_RE = re.compile(
+        r"\b("
+        r"task|tasks|camera|device|telegram|pairing|stream|feed|mcp|settings|key|token"
+        r")\b",
+        flags=re.IGNORECASE,
+    )
+    _COMPLETION_CLAIM_RE = re.compile(
+        r"\b("
+        r"done|created|added|removed|deleted|updated|approved|paired|configured|"
+        r"current\s+task\s+status|task\s+id|status:\s|successfully"
+        r")\b",
+        flags=re.IGNORECASE,
+    )
+
+    def _mcp_verification_required(user_message: str, assistant_text: str) -> bool:
+        if not _STATEFUL_REQUEST_RE.search(user_message or ""):
+            return False
+        if not _BACKEND_ENTITY_RE.search(user_message or ""):
+            return False
+        return bool(_COMPLETION_CLAIM_RE.search(assistant_text or ""))
+
     def _is_private_or_local_host(hostname: str) -> bool:
         host = hostname.strip().lower().strip(".")
         if not host:
@@ -1229,6 +1257,8 @@ def create_app() -> Flask:
 
     def _generate_chat_response(session_id: str, user_message: str, selected_model: Optional[str]) -> str:
         messages = _build_llm_messages(session_id=session_id, user_message=user_message)
+        mcp_call_happened = False
+        forced_mcp_retry = False
         for _ in range(shell_max_calls_per_turn + 1):
             assistant_text = _call_llm(messages=messages, selected_model=selected_model)
             try:
@@ -1242,6 +1272,7 @@ def create_app() -> Flask:
                 if tool_name in mcp_disabled_tools:
                     return f"MCP tool '{tool_name}' is disabled by configuration."
                 mcp_result = mcp_broker.call_tool(full_name=tool_name, arguments=args)
+                mcp_call_happened = True
                 messages.append({"role": "assistant", "content": assistant_text})
                 messages.append(
                     {
@@ -1286,6 +1317,31 @@ def create_app() -> Flask:
                 continue
             shell_command = _extract_shell_command(assistant_text)
             if not shell_command:
+                if (
+                    not mcp_call_happened
+                    and mcp_enabled_runtime
+                    and bool(_get_active_mcp_tools())
+                    and _mcp_verification_required(user_message, assistant_text)
+                ):
+                    if forced_mcp_retry:
+                        return (
+                            "I couldn't verify that in the backend yet. "
+                            "I'll run the MCP tool first before claiming completion."
+                        )
+                    forced_mcp_retry = True
+                    messages.append({"role": "assistant", "content": assistant_text})
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Your previous response claimed backend state without calling an MCP tool. "
+                                "For this request, call exactly one MCP tool now using "
+                                "<tool:mcp name=\"server.tool\">{\"arg\":\"value\"}</tool:mcp> "
+                                "and do not provide a normal answer yet."
+                            ),
+                        }
+                    )
+                    continue
                 return assistant_text
             if not shell_enabled_runtime:
                 return "Shell access is disabled by configuration."
