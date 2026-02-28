@@ -489,7 +489,7 @@ def create_app() -> Flask:
     forward_enabled = _env_bool("ADMINAGENT_FORWARD_ENABLED", False)
     forward_url = os.getenv("ADMINAGENT_FORWARD_URL", "").strip()
     forward_token = os.getenv("ADMINAGENT_FORWARD_TOKEN", "").strip()
-    default_model = os.getenv("ADMINAGENT_MODEL", "gpt-5-mini").strip() or "gpt-5-mini"
+    default_model = os.getenv("ADMINAGENT_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
     llm_timeout_s = int(os.getenv("ADMINAGENT_LLM_TIMEOUT_S", "60"))
     llm_system_prompt = os.getenv(
         "ADMINAGENT_SYSTEM_PROMPT",
@@ -517,6 +517,7 @@ def create_app() -> Flask:
     gateway_token = os.getenv("GATEWAY_TOKEN", "").strip()
     model_catalog: Dict[str, List[Dict[str, str]]] = {
         "openai": [
+            {"id": "gpt-4o-mini", "label": "GPT-4o mini"},
             {"id": "gpt-5.3-codex", "label": "GPT 5.3-codex"},
             {"id": "gpt-5-thinking-high", "label": "GPT-5-Thinking (High)"},
             {"id": "gpt-5-mini", "label": "GPT-5 mini"},
@@ -1739,7 +1740,10 @@ def create_app() -> Flask:
         const body = document.createElement("div");
         const payload = (event || {}).payload;
         const rendered = String((event || {}).rendered_message || "").trim();
-        if (rendered) {
+        const eventError = String((event || {}).error || "").trim();
+        if (eventError) {
+          body.textContent = "Error: " + eventError + (payload && typeof payload === "object" ? "\n" + JSON.stringify(payload) : "");
+        } else if (rendered) {
           body.textContent = rendered;
         } else if (payload && typeof payload === "object") {
           body.textContent = JSON.stringify(payload);
@@ -2241,10 +2245,22 @@ def create_app() -> Flask:
         if not isinstance(data, dict):
             return jsonify({"status": "error", "error": "JSON body is required"}), 400
 
-        openai_api_key = str(data.get("openai_api_key", "")).strip()
-        anthropic_api_key = str(data.get("anthropic_api_key", "")).strip()
-        google_api_key = str(data.get("google_api_key", "")).strip()
-        telegram_bot_token = str(data.get("telegram_bot_token", "")).strip()
+        if "openai_api_key" in data:
+            next_openai_api_key = str(data.get("openai_api_key", "")).strip()
+            if next_openai_api_key:
+                openai_api_key = next_openai_api_key
+        if "anthropic_api_key" in data:
+            next_anthropic_api_key = str(data.get("anthropic_api_key", "")).strip()
+            if next_anthropic_api_key:
+                anthropic_api_key = next_anthropic_api_key
+        if "google_api_key" in data:
+            next_google_api_key = str(data.get("google_api_key", "")).strip()
+            if next_google_api_key:
+                google_api_key = next_google_api_key
+        if "telegram_bot_token" in data:
+            next_telegram_bot_token = str(data.get("telegram_bot_token", "")).strip()
+            if next_telegram_bot_token:
+                telegram_bot_token = next_telegram_bot_token
 
         os.environ["OPENAI_API_KEY"] = openai_api_key
         os.environ["ANTHROPIC_API_KEY"] = anthropic_api_key
