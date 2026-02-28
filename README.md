@@ -15,7 +15,10 @@ OpenAI-compatible endpoint, and can optionally forward assistant replies downstr
 PORT=18789
 ADMINAGENT_LLM_URL=http://127.0.0.1:11434/v1/chat/completions
 ADMINAGENT_MODEL=llama3.2
-ADMINAGENT_LLM_API_KEY=replace-with-your-openai-api-key
+OPENAI_API_KEY=replace-with-your-openai-api-key
+ANTHROPIC_API_KEY=
+GOOGLE_API_KEY=
+ADMINAGENT_LLM_API_KEY=
 ADMINAGENT_DB_PATH=./adminagent.db
 ADMINAGENT_SHELL_ENABLED=1
 ADMINAGENT_SHELL_CWD=.
@@ -56,7 +59,10 @@ For a local model on your laptop, `ADMINAGENT_LLM_URL` should also use `host.doc
 - `PORT` (default: `18789`)
 - `ADMINAGENT_LLM_URL` (OpenAI-compatible chat completions endpoint)
 - `ADMINAGENT_MODEL` (model name sent to LLM endpoint)
-- `ADMINAGENT_LLM_API_KEY` (Bearer token for LLM endpoint)
+- `OPENAI_API_KEY` (primary key used for OpenAI models)
+- `ANTHROPIC_API_KEY` (used for Anthropic models)
+- `GOOGLE_API_KEY` (used for Google/Gemini models)
+- `ADMINAGENT_LLM_API_KEY` (legacy fallback key name; still supported)
 - `ADMINAGENT_DB_PATH` (default: `adminagent.db`, local SQLite file for session memory)
 - `ADMINAGENT_SESSION_MAX_MESSAGES` (default: `100`, per-session retained messages)
 - `ADMINAGENT_SYSTEM_PROMPT` (optional system prompt)

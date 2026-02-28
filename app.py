@@ -508,7 +508,10 @@ def create_app() -> Flask:
     telegram_poll_enabled = _env_bool("TELEGRAM_POLL_ENABLED", True)
     telegram_poll_timeout_s = max(1, min(50, int(os.getenv("TELEGRAM_POLL_TIMEOUT_S", "25"))))
     telegram_poll_retry_s = max(1, int(os.getenv("TELEGRAM_POLL_RETRY_S", "5")))
-    openai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    openai_api_key = (
+        os.getenv("OPENAI_API_KEY", "").strip()
+        or os.getenv("ADMINAGENT_LLM_API_KEY", "").strip()
+    )
     anthropic_api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     google_api_key = os.getenv("GOOGLE_API_KEY", "").strip()
     gateway_token = os.getenv("GATEWAY_TOKEN", "").strip()
@@ -780,7 +783,34 @@ def create_app() -> Flask:
                 convo.append({"role": role, "content": content})
         return "\n\n".join(system_parts).strip(), convo
 
-    def _call_openai(messages: List[Dict[str, str]], model_name: str) -> str:
+    def _extract_openai_responses_text(payload: Dict[str, Any]) -> str:
+        # Prefer the canonical flattened field when present.
+        output_text = str(payload.get("output_text", "")).strip()
+        if output_text:
+            return output_text
+
+        # Fallback: walk output[].content[] blocks.
+        output = payload.get("output")
+        if isinstance(output, list):
+            parts: List[str] = []
+            for item in output:
+                if not isinstance(item, dict):
+                    continue
+                content = item.get("content")
+                if not isinstance(content, list):
+                    continue
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    text = str(block.get("text", "")).strip()
+                    if text:
+                        parts.append(text)
+            joined = "\n".join(parts).strip()
+            if joined:
+                return joined
+        return ""
+
+    def _call_openai_chat_completions(messages: List[Dict[str, str]], model_name: str) -> str:
         if not openai_api_key:
             raise RuntimeError("OPENAI_API_KEY is required for OpenAI models")
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {openai_api_key}"}
@@ -806,6 +836,45 @@ def create_app() -> Flask:
         if not assistant_text:
             raise RuntimeError("OpenAI response did not include assistant content")
         return assistant_text
+
+    def _call_openai_responses(messages: List[Dict[str, str]], model_name: str) -> str:
+        if not openai_api_key:
+            raise RuntimeError("OPENAI_API_KEY is required for OpenAI models")
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {openai_api_key}"}
+        payload = {
+            "model": model_name,
+            "input": messages,
+        }
+        resp = requests.post(
+            "https://api.openai.com/v1/responses",
+            json=payload,
+            headers=headers,
+            timeout=llm_timeout_s,
+        )
+        if resp.status_code >= 400:
+            detail = (resp.text or "").strip()
+            raise RuntimeError(f"OpenAI API error {resp.status_code}: {detail[:500] or 'request failed'}")
+        data = resp.json() if resp.text else {}
+        if not isinstance(data, dict):
+            raise RuntimeError("OpenAI responses API returned invalid payload")
+        assistant_text = _extract_openai_responses_text(data)
+        if not assistant_text:
+            raise RuntimeError("OpenAI responses API did not include assistant content")
+        return assistant_text
+
+    def _call_openai(messages: List[Dict[str, str]], model_name: str) -> str:
+        lower = model_name.lower()
+        should_try_responses_first = lower.startswith("gpt-5") or "codex" in lower or lower.startswith("o1") or lower.startswith("o3")
+
+        if should_try_responses_first:
+            try:
+                return _call_openai_responses(messages=messages, model_name=model_name)
+            except Exception as exc:
+                msg = str(exc).lower()
+                if "404" in msg or "not found" in msg or "responses" in msg:
+                    return _call_openai_chat_completions(messages=messages, model_name=model_name)
+                raise
+        return _call_openai_chat_completions(messages=messages, model_name=model_name)
 
     def _call_anthropic(messages: List[Dict[str, str]], model_name: str) -> str:
         if not anthropic_api_key:
