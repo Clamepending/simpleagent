@@ -14,12 +14,28 @@ import subprocess
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from html import unescape
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
 import requests
 from flask import Flask, jsonify, request
+from simpleagent.core.contract import (
+    ContractValidationError,
+    RUNTIME_CONTRACT_VERSION_V1,
+    capabilities_payload,
+    health_payload,
+    parse_turn_request,
+    turn_error_payload,
+    turn_success_payload,
+)
+from simpleagent.core.tools import (
+    ToolInvocation,
+    ToolResultEnvelope,
+    parse_tool_tag_v1,
+)
+from simpleagent.core.turn_engine import run_turn_loop
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -969,6 +985,207 @@ class SqliteSessionStore:
                     for row in outbound_ready_top_bots
                 ],
             },
+        }
+
+    def engagement_metrics(
+        self,
+        *,
+        window_days: int = 7,
+        engaged_event_threshold: int = 3,
+        limit: int = 50,
+    ) -> Dict[str, Any]:
+        clean_window_days = max(1, min(90, int(window_days)))
+        clean_threshold = max(1, min(1000, int(engaged_event_threshold)))
+        clean_limit = max(1, min(500, int(limit)))
+
+        now = time.time()
+        day_s = 24.0 * 60.0 * 60.0
+        current_start = now - (float(clean_window_days) * day_s)
+        previous_start = now - (float(clean_window_days * 2) * day_s)
+        start_24h = now - day_s
+
+        with self.lock, self._connect() as conn:
+            active_24h_row = conn.execute(
+                """
+                SELECT COUNT(DISTINCT bot_id) AS c
+                FROM (
+                    SELECT bot_id FROM inbound_queue WHERE created_at >= ?
+                    UNION
+                    SELECT bot_id FROM outbound_queue WHERE created_at >= ?
+                )
+                """,
+                (start_24h, start_24h),
+            ).fetchone()
+
+            active_current_row = conn.execute(
+                """
+                SELECT COUNT(DISTINCT bot_id) AS c
+                FROM (
+                    SELECT bot_id FROM inbound_queue WHERE created_at >= ?
+                    UNION
+                    SELECT bot_id FROM outbound_queue WHERE created_at >= ?
+                )
+                """,
+                (current_start, current_start),
+            ).fetchone()
+
+            success_row = conn.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) AS done_count,
+                    SUM(CASE WHEN status IN ('done', 'error', 'dead_letter') THEN 1 ELSE 0 END) AS terminal_count
+                FROM (
+                    SELECT status FROM inbound_queue WHERE created_at >= ?
+                    UNION ALL
+                    SELECT status FROM outbound_queue WHERE created_at >= ?
+                )
+                """,
+                (current_start, current_start),
+            ).fetchone()
+
+            previous_active_row = conn.execute(
+                """
+                SELECT COUNT(DISTINCT bot_id) AS c
+                FROM (
+                    SELECT bot_id FROM inbound_queue WHERE created_at >= ? AND created_at < ?
+                    UNION
+                    SELECT bot_id FROM outbound_queue WHERE created_at >= ? AND created_at < ?
+                )
+                """,
+                (previous_start, current_start, previous_start, current_start),
+            ).fetchone()
+
+            retained_row = conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM (
+                    SELECT DISTINCT bot_id
+                    FROM (
+                        SELECT bot_id, created_at FROM inbound_queue
+                        UNION ALL
+                        SELECT bot_id, created_at FROM outbound_queue
+                    )
+                    WHERE created_at >= ? AND created_at < ?
+                ) previous_active
+                INNER JOIN (
+                    SELECT DISTINCT bot_id
+                    FROM (
+                        SELECT bot_id, created_at FROM inbound_queue
+                        UNION ALL
+                        SELECT bot_id, created_at FROM outbound_queue
+                    )
+                    WHERE created_at >= ? AND created_at < ?
+                ) current_active
+                ON current_active.bot_id = previous_active.bot_id
+                """,
+                (previous_start, current_start, current_start, now),
+            ).fetchone()
+
+            engaged_row = conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM (
+                    SELECT bot_id, COUNT(*) AS events_count
+                    FROM (
+                        SELECT bot_id FROM inbound_queue WHERE created_at >= ?
+                        UNION ALL
+                        SELECT bot_id FROM outbound_queue WHERE created_at >= ?
+                    )
+                    GROUP BY bot_id
+                    HAVING COUNT(*) >= ?
+                )
+                """,
+                (current_start, current_start, clean_threshold),
+            ).fetchone()
+
+            bot_rows = conn.execute(
+                """
+                WITH current_events AS (
+                    SELECT bot_id, status, created_at, 'inbound' AS queue_name
+                    FROM inbound_queue
+                    WHERE created_at >= ?
+                    UNION ALL
+                    SELECT bot_id, status, created_at, 'outbound' AS queue_name
+                    FROM outbound_queue
+                    WHERE created_at >= ?
+                )
+                SELECT
+                    current_events.bot_id AS bot_id,
+                    COALESCE(bots.name, current_events.bot_id) AS bot_name,
+                    COUNT(*) AS events_count,
+                    SUM(CASE WHEN current_events.queue_name = 'inbound' THEN 1 ELSE 0 END) AS inbound_count,
+                    SUM(CASE WHEN current_events.queue_name = 'outbound' THEN 1 ELSE 0 END) AS outbound_count,
+                    SUM(CASE WHEN current_events.status = 'done' THEN 1 ELSE 0 END) AS done_count,
+                    SUM(CASE WHEN current_events.status IN ('done', 'error', 'dead_letter') THEN 1 ELSE 0 END) AS terminal_count,
+                    MAX(current_events.created_at) AS last_event_at
+                FROM current_events
+                LEFT JOIN bots ON bots.bot_id = current_events.bot_id
+                GROUP BY current_events.bot_id
+                ORDER BY events_count DESC, current_events.bot_id ASC
+                LIMIT ?
+                """,
+                (current_start, current_start, clean_limit),
+            ).fetchall()
+
+        active_24h = int((active_24h_row or {"c": 0})["c"] or 0)
+        active_current = int((active_current_row or {"c": 0})["c"] or 0)
+        previous_active = int((previous_active_row or {"c": 0})["c"] or 0)
+        retained = int((retained_row or {"c": 0})["c"] or 0)
+        engaged = int((engaged_row or {"c": 0})["c"] or 0)
+
+        done_count = int((success_row or {"done_count": 0})["done_count"] or 0)
+        terminal_count = int((success_row or {"terminal_count": 0})["terminal_count"] or 0)
+        failed_count = max(0, terminal_count - done_count)
+
+        success_rate_pct = (100.0 * float(done_count) / float(terminal_count)) if terminal_count > 0 else None
+        retention_rate_pct = (100.0 * float(retained) / float(previous_active)) if previous_active > 0 else None
+        engagement_rate_pct = (100.0 * float(engaged) / float(active_current)) if active_current > 0 else None
+
+        bots: List[Dict[str, Any]] = []
+        for row in bot_rows:
+            events_count = int(row["events_count"] or 0)
+            bot_terminal = int(row["terminal_count"] or 0)
+            bot_done = int(row["done_count"] or 0)
+            bots.append(
+                {
+                    "bot_id": str(row["bot_id"]),
+                    "bot_name": str(row["bot_name"]),
+                    "events_count": events_count,
+                    "inbound_count": int(row["inbound_count"] or 0),
+                    "outbound_count": int(row["outbound_count"] or 0),
+                    "done_count": bot_done,
+                    "failed_count": max(0, bot_terminal - bot_done),
+                    "success_rate_pct": (100.0 * float(bot_done) / float(bot_terminal)) if bot_terminal > 0 else None,
+                    "last_event_at": float(row["last_event_at"]) if row["last_event_at"] is not None else None,
+                }
+            )
+
+        return {
+            "generated_at": now,
+            "window_days": clean_window_days,
+            "engaged_event_threshold": clean_threshold,
+            "kpis": {
+                "active_agents_24h": active_24h,
+                "active_agents_window": active_current,
+                "retention_7d_pct": retention_rate_pct,
+                "retention_7d": {
+                    "retained_agents": retained,
+                    "previous_active_agents": previous_active,
+                    "current_active_agents": active_current,
+                },
+                "success_rate_window_pct": success_rate_pct,
+                "success_rate_window": {
+                    "done_events": done_count,
+                    "failed_events": failed_count,
+                    "terminal_events": terminal_count,
+                },
+                "engagement_rate_window_pct": engagement_rate_pct,
+                "engagement_rate_window": {
+                    "engaged_agents": engaged,
+                    "active_agents_window": active_current,
+                },
+            },
+            "bots": bots,
         }
 
     def list_dead_letter_events(self, queue: str = "both", limit: int = 100, bot_id: Optional[str] = None) -> Dict[str, Any]:
@@ -1949,6 +2166,14 @@ def create_app() -> Flask:
     autoscale_delivery_max_workers = max(autoscale_delivery_min_workers, _env_int_with_legacy("SIMPLEAGENT_AUTOSCALE_DELIVERY_MAX_WORKERS", 100))
     autoscale_max_step_up = max(1, _env_int_with_legacy("SIMPLEAGENT_AUTOSCALE_MAX_STEP_UP", 10))
     autoscale_max_step_down = max(1, _env_int_with_legacy("SIMPLEAGENT_AUTOSCALE_MAX_STEP_DOWN", 10))
+    runtime_kind = _env_str_with_legacy("SIMPLEAGENT_RUNTIME_KIND", "simpleagent_oss_local").strip() or "simpleagent_oss_local"
+    runtime_version = _env_str_with_legacy("SIMPLEAGENT_RUNTIME_VERSION", "oss-v1").strip() or "oss-v1"
+    runtime_contract_version = RUNTIME_CONTRACT_VERSION_V1
+    runtime_tools_protocol = "tool-tag-v1"
+    runtime_max_tool_passes = max(1, _env_int_with_legacy("SIMPLEAGENT_MAX_TOOL_PASSES", 4))
+    runtime_max_turn_seconds = max(1, _env_int_with_legacy("SIMPLEAGENT_MAX_TURN_SECONDS", 90))
+    runtime_max_tool_call_seconds = max(1, _env_int_with_legacy("SIMPLEAGENT_MAX_TOOL_CALL_SECONDS", 30))
+    runtime_max_output_chars = max(200, _env_int_with_legacy("SIMPLEAGENT_MAX_OUTPUT_CHARS", 8000))
 
     model_catalog: Dict[str, List[Dict[str, str]]] = {
         "openai": [
@@ -2269,6 +2494,16 @@ def create_app() -> Flask:
             f"{_truncate_text(context_files.get('USER.md', ''), 4000)}\n\n"
             "[HEARTBEAT.md]\n"
             f"{_truncate_text(context_files.get('HEARTBEAT.md', ''), 4000)}"
+        )
+
+        effective_system_prompt = (
+            f"{effective_system_prompt}\n\n"
+            "Execution behavior:\n"
+            "- For direct action requests, act immediately by using a tool when one is available.\n"
+            "- Do not ask for continuation confirmations like 'ok', 'go on', or 'should I proceed?'.\n"
+            "- Do not narrate intent such as 'I will do that now' without taking action.\n"
+            "- Ask follow-up questions only when blocked by missing required information or explicit irreversible-action approval.\n"
+            "- When follow-up is required, ask once and include all missing required fields in a single message."
         )
 
         mcp_tools = _get_active_mcp_tools()
@@ -2978,6 +3213,245 @@ def create_app() -> Flask:
             "message": msg,
             "telegram_result": delivery.get("telegram_result"),
             "delivery": delivery,
+        }
+
+    def _is_tool_allowed(
+        *,
+        tool_name: str,
+        enabled_tools: Optional[List[str]],
+        disabled_tools_policy: Optional[List[str]],
+    ) -> bool:
+        normalized_name = str(tool_name or "").strip()
+        disabled_set = {str(item or "").strip() for item in (disabled_tools_policy or []) if str(item or "").strip()}
+        if normalized_name in disabled_set:
+            return False
+        enabled_set = {str(item or "").strip() for item in (enabled_tools or []) if str(item or "").strip()}
+        if not enabled_set:
+            return True
+        return normalized_name in enabled_set
+
+    def _resolve_contract_tool_call(assistant_text: str, step: int) -> Optional[ToolInvocation]:
+        invocation = parse_tool_tag_v1(assistant_text, step)
+        if invocation is not None:
+            return invocation
+
+        if _extract_get_callback_url_call(assistant_text):
+            return ToolInvocation(
+                call_id=f"tc_{step}",
+                name="get_callback_url",
+                source="gateway",
+                arguments={},
+                step=step,
+            )
+
+        telegram_message = _extract_telegram_send_call(assistant_text)
+        if telegram_message is not None:
+            return ToolInvocation(
+                call_id=f"tc_{step}",
+                name="send_telegram_messege",
+                source="gateway",
+                arguments={"message": telegram_message},
+                step=step,
+            )
+        return None
+
+    def _execute_contract_tool_call(
+        *,
+        bot: Dict[str, Any],
+        session_id: str,
+        invocation: ToolInvocation,
+        enabled_tools: Optional[List[str]] = None,
+        disabled_tools_policy: Optional[List[str]] = None,
+    ) -> ToolResultEnvelope:
+        def _bounded_envelope(envelope: ToolResultEnvelope) -> ToolResultEnvelope:
+            max_latency_ms = int(runtime_max_tool_call_seconds) * 1000
+            if envelope.latency_ms <= max_latency_ms:
+                return envelope
+            return ToolResultEnvelope(
+                ok=False,
+                tool=envelope.tool,
+                call_id=envelope.call_id,
+                result=None,
+                error=f"Tool '{envelope.tool}' exceeded max_tool_call_seconds={runtime_max_tool_call_seconds}",
+                latency_ms=envelope.latency_ms,
+            )
+
+        if not _is_tool_allowed(
+            tool_name=invocation.name,
+            enabled_tools=enabled_tools,
+            disabled_tools_policy=disabled_tools_policy,
+        ):
+            return _bounded_envelope(ToolResultEnvelope(
+                ok=False,
+                tool=invocation.name,
+                call_id=invocation.call_id,
+                result=None,
+                error=f"Tool '{invocation.name}' is disabled by policy.",
+                latency_ms=0,
+            ))
+
+        started = time.time()
+        bot_id = str(bot["bot_id"])
+        try:
+            if invocation.source == "mcp":
+                tool_name = invocation.name
+                if not mcp_enabled_runtime:
+                    raise RuntimeError("MCP access is disabled by configuration.")
+                if tool_name in mcp_disabled_tools:
+                    raise RuntimeError(f"MCP tool '{tool_name}' is disabled by configuration.")
+                mcp_result = mcp_broker.call_tool(
+                    full_name=tool_name,
+                    arguments=invocation.arguments,
+                    bot_id=bot_id,
+                )
+                latency_ms = int((time.time() - started) * 1000)
+                return _bounded_envelope(ToolResultEnvelope(
+                    ok=True,
+                    tool=invocation.name,
+                    call_id=invocation.call_id,
+                    result={"bot_id": bot_id, "tool": tool_name, "result": mcp_result},
+                    error=None,
+                    latency_ms=latency_ms,
+                ))
+
+            tool_name = invocation.name
+            if tool_name == "shell":
+                if not shell_enabled_runtime:
+                    raise RuntimeError("Shell access is disabled by configuration.")
+                command = str(invocation.arguments.get("value", "")).strip()
+                shell_result = _run_shell(command)
+                return _bounded_envelope(ToolResultEnvelope(
+                    ok=bool(shell_result.get("ok", False)),
+                    tool=tool_name,
+                    call_id=invocation.call_id,
+                    result={"bot_id": bot_id, **shell_result},
+                    error=str(shell_result.get("error", "")).strip() or None,
+                    latency_ms=int((time.time() - started) * 1000),
+                ))
+
+            if tool_name == "web_search":
+                query = str(invocation.arguments.get("value", "")).strip()
+                web_result = _web_search(query)
+                return _bounded_envelope(ToolResultEnvelope(
+                    ok=True,
+                    tool=tool_name,
+                    call_id=invocation.call_id,
+                    result={"bot_id": bot_id, **web_result},
+                    error=None,
+                    latency_ms=int((time.time() - started) * 1000),
+                ))
+
+            if tool_name == "web_fetch":
+                url = str(invocation.arguments.get("value", "")).strip()
+                web_result = _web_fetch(url)
+                return _bounded_envelope(ToolResultEnvelope(
+                    ok=True,
+                    tool=tool_name,
+                    call_id=invocation.call_id,
+                    result={"bot_id": bot_id, **web_result},
+                    error=None,
+                    latency_ms=int((time.time() - started) * 1000),
+                ))
+
+            if tool_name == "gateway":
+                gateway_result = _handle_gateway_tool(bot_id=bot_id, call=invocation.arguments)
+                return _bounded_envelope(ToolResultEnvelope(
+                    ok=bool(gateway_result.get("ok", False)),
+                    tool=tool_name,
+                    call_id=invocation.call_id,
+                    result=gateway_result,
+                    error=None,
+                    latency_ms=int((time.time() - started) * 1000),
+                ))
+
+            if tool_name == "current_time":
+                timezone_name = str(invocation.arguments.get("timezone", "UTC")).strip() or "UTC"
+                now_iso = datetime.now(timezone.utc).isoformat()
+                return _bounded_envelope(ToolResultEnvelope(
+                    ok=True,
+                    tool=tool_name,
+                    call_id=invocation.call_id,
+                    result={"timezone": timezone_name, "now_iso": now_iso},
+                    error=None,
+                    latency_ms=int((time.time() - started) * 1000),
+                ))
+
+            if tool_name == "get_callback_url":
+                return _bounded_envelope(ToolResultEnvelope(
+                    ok=True,
+                    tool=tool_name,
+                    call_id=invocation.call_id,
+                    result={
+                        "bot_id": bot_id,
+                        "callback_url": _get_callback_url(),
+                        "path": "/hooks/outward_inbox",
+                    },
+                    error=None,
+                    latency_ms=int((time.time() - started) * 1000),
+                ))
+
+            if tool_name == "send_telegram_messege":
+                telegram_result = _send_telegram_tool_message(
+                    bot=bot,
+                    current_session_id=session_id,
+                    message_text=str(invocation.arguments.get("message", "")).strip(),
+                )
+                return _bounded_envelope(ToolResultEnvelope(
+                    ok=bool(telegram_result.get("ok", False)),
+                    tool=tool_name,
+                    call_id=invocation.call_id,
+                    result=telegram_result,
+                    error=None,
+                    latency_ms=int((time.time() - started) * 1000),
+                ))
+
+            raise RuntimeError(f"Unknown tool '{tool_name}'")
+        except Exception as exc:
+            return _bounded_envelope(ToolResultEnvelope(
+                ok=False,
+                tool=invocation.name,
+                call_id=invocation.call_id,
+                result=None,
+                error=str(exc),
+                latency_ms=int((time.time() - started) * 1000),
+            ))
+
+    def _run_contract_turn(
+        *,
+        bot: Dict[str, Any],
+        session_id: str,
+        user_message: str,
+        selected_model: Optional[str],
+        enabled_tools: Optional[List[str]],
+        disabled_tools_policy: Optional[List[str]],
+    ) -> Dict[str, Any]:
+        messages = _build_llm_messages(
+            bot=bot,
+            session_id=session_id,
+            user_message=user_message,
+        )
+
+        def _call_model(messages_payload: List[Dict[str, str]]) -> str:
+            return _call_llm(messages=messages_payload, selected_model=selected_model, bot=bot)
+
+        outcome = run_turn_loop(
+            initial_messages=messages,
+            call_model=_call_model,
+            parse_tool_call=_resolve_contract_tool_call,
+            execute_tool_call=lambda invocation: _execute_contract_tool_call(
+                bot=bot,
+                session_id=session_id,
+                invocation=invocation,
+                enabled_tools=enabled_tools,
+                disabled_tools_policy=disabled_tools_policy,
+            ),
+            max_tool_passes=runtime_max_tool_passes,
+            max_turn_seconds=runtime_max_turn_seconds,
+            max_output_chars=runtime_max_output_chars,
+        )
+        return {
+            "assistant_message": outcome.assistant_message,
+            "tool_trace": outcome.tool_trace,
         }
 
     def _generate_chat_response(
@@ -4417,7 +4891,7 @@ def create_app() -> Flask:
 <body>
   <div class="wrap">
     <h1>SimpleAgent Ops Dashboard</h1>
-    <p class="muted">Queue, dead-letter, autoscale signals/recommendations, and manual worker processing. Use the chat UI at <a href="/" style="color:#9fc0ff;">/</a> for normal bot interaction.</p>
+    <p class="muted">Queue, dead-letter, autoscale, engagement KPIs, and manual worker processing. Use the chat UI at <a href="/" style="color:#9fc0ff;">/</a> for normal bot interaction.</p>
 
     <div class="chips">
       <span class="chip" id="chipMode">service_mode: ?</span>
@@ -4425,6 +4899,13 @@ def create_app() -> Flask:
       <span class="chip" id="chipExecutor">executor: ?</span>
       <span class="chip" id="chipDelivery">delivery: ?</span>
       <span class="chip" id="chipPoller">poller: ?</span>
+    </div>
+
+    <div class="chips">
+      <span class="chip" id="kpiActive">active_24h: ?</span>
+      <span class="chip" id="kpiRetention">retention_7d: ?</span>
+      <span class="chip" id="kpiSuccess">success_window: ?</span>
+      <span class="chip" id="kpiEngagement">engagement_window: ?</span>
     </div>
 
     <div class="grid">
@@ -4467,6 +4948,17 @@ def create_app() -> Flask:
       </section>
 
       <section class="panel">
+        <h3>Engagement KPI</h3>
+        <div class="row">
+          <input id="engWindowDays" type="text" value="7" />
+          <input id="engThreshold" type="text" value="3" />
+          <input id="engLimit" type="text" value="50" />
+          <button id="engagementBtn" type="button" class="secondary">Load Engagement</button>
+        </div>
+        <p class="muted">Inputs: window_days, engaged_event_threshold, top-bot limit.</p>
+      </section>
+
+      <section class="panel">
         <h3>Dead-Letter</h3>
         <div class="row">
           <button id="listDeadBtn" type="button">List Dead-Letter</button>
@@ -4499,6 +4991,10 @@ def create_app() -> Flask:
     const chipExecutor = document.getElementById("chipExecutor");
     const chipDelivery = document.getElementById("chipDelivery");
     const chipPoller = document.getElementById("chipPoller");
+    const kpiActive = document.getElementById("kpiActive");
+    const kpiRetention = document.getElementById("kpiRetention");
+    const kpiSuccess = document.getElementById("kpiSuccess");
+    const kpiEngagement = document.getElementById("kpiEngagement");
 
     function parseEventIds(text) {
       return String(text || "")
@@ -4513,6 +5009,11 @@ def create_app() -> Flask:
       const n = Number(t);
       if (!Number.isFinite(n)) return null;
       return Math.trunc(n);
+    }
+
+    function pct(v) {
+      if (typeof v !== "number" || !Number.isFinite(v)) return "?";
+      return v.toFixed(1) + "%";
     }
 
     async function req(path, method = "GET", body = null) {
@@ -4555,6 +5056,43 @@ def create_app() -> Flask:
       }
     }
 
+    function engagementPath() {
+      const w = maybeInt(document.getElementById("engWindowDays").value) || 7;
+      const t = maybeInt(document.getElementById("engThreshold").value) || 3;
+      const l = maybeInt(document.getElementById("engLimit").value) || 50;
+      const q = new URLSearchParams({
+        window_days: String(w),
+        engaged_event_threshold: String(t),
+        limit: String(l)
+      });
+      return "/api/engagement?" + q.toString();
+    }
+
+    async function refreshEngagement(writeOutput) {
+      const data = await req(engagementPath());
+      const e = data.engagement || {};
+      const k = e.kpis || {};
+      const retention = k.retention_7d || {};
+      const success = k.success_rate_window || {};
+      const engagement = k.engagement_rate_window || {};
+
+      kpiActive.textContent = "active_24h: " + String(k.active_agents_24h ?? "?");
+      kpiRetention.textContent =
+        "retention_7d: " + pct(k.retention_7d_pct) +
+        " (" + String(retention.retained_agents ?? "?") + "/" + String(retention.previous_active_agents ?? "?") + ")";
+      kpiSuccess.textContent =
+        "success_window: " + pct(k.success_rate_window_pct) +
+        " (" + String(success.done_events ?? "?") + "/" + String(success.terminal_events ?? "?") + ")";
+      kpiEngagement.textContent =
+        "engagement_window: " + pct(k.engagement_rate_window_pct) +
+        " (" + String(engagement.engaged_agents ?? "?") + "/" + String(engagement.active_agents_window ?? "?") + ")";
+
+      if (writeOutput) {
+        append("engagement", data);
+      }
+      return data;
+    }
+
     document.getElementById("refreshBtn").addEventListener("click", async () => {
       try {
         const [health, stats, metrics, signals] = await Promise.all([
@@ -4567,6 +5105,7 @@ def create_app() -> Flask:
         append("queue_stats", stats);
         append("metrics", metrics);
         append("autoscale_signals", signals);
+        await refreshEngagement(true);
         await refreshChips();
       } catch (err) {
         append("refresh error", { error: String(err) });
@@ -4594,6 +5133,14 @@ def create_app() -> Flask:
         );
       } catch (err) {
         append("autoscale_recommendation error", { error: String(err) });
+      }
+    });
+
+    document.getElementById("engagementBtn").addEventListener("click", async () => {
+      try {
+        await refreshEngagement(true);
+      } catch (err) {
+        append("engagement error", { error: String(err) });
       }
     });
 
@@ -4651,7 +5198,232 @@ def create_app() -> Flask:
       }
     });
 
-    (async () => { await refreshChips(); })();
+    (async () => {
+      await refreshChips();
+      try {
+        await refreshEngagement(false);
+      } catch (err) {
+        append("engagement bootstrap error", { error: String(err) });
+      }
+    })();
+  </script>
+</body>
+</html>
+"""
+
+    @app.route("/engagement", methods=["GET"])
+    def engagement_dashboard():
+        return """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SimpleAgent Engagement</title>
+  <style>
+    :root {
+      --bg: #0f1222;
+      --panel: #17203a;
+      --line: #304575;
+      --text: #ecf2ff;
+      --muted: #aebce0;
+      --bar: #4f7eff;
+      --bar2: #55c4a8;
+    }
+    body {
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+      background: radial-gradient(circle at top, #14284d, var(--bg) 55%);
+      color: var(--text);
+    }
+    .wrap {
+      max-width: 1040px;
+      margin: 0 auto;
+      padding: 18px 14px 28px;
+    }
+    h1 { margin: 0 0 8px; font-size: 24px; }
+    .muted { margin: 0 0 12px; color: var(--muted); font-size: 13px; }
+    .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+    .chip {
+      border: 1px solid #3b5798;
+      border-radius: 999px;
+      padding: 3px 10px;
+      font-size: 12px;
+      color: #d7e1ff;
+      background: #1b2b59;
+    }
+    .grid {
+      display: grid;
+      gap: 10px;
+      grid-template-columns: 1fr;
+    }
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--panel);
+      padding: 10px;
+    }
+    .panel h3 { margin: 0 0 8px; font-size: 14px; }
+    canvas {
+      width: 100%;
+      height: 280px;
+      border: 1px solid #2b3f6d;
+      border-radius: 10px;
+      background: #0e1731;
+      display: block;
+    }
+    @media (max-width: 920px) {
+      canvas { height: 240px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Engagement Graphs</h1>
+    <p class="muted">Auto-refresh every 30 seconds. Data from <code>/api/engagement</code>.</p>
+    <div class="chips">
+      <span class="chip" id="chipActive">active_24h: ?</span>
+      <span class="chip" id="chipRetention">retention_7d: ?</span>
+      <span class="chip" id="chipSuccess">success_7d: ?</span>
+      <span class="chip" id="chipEngagement">engagement_7d: ?</span>
+      <span class="chip" id="chipUpdated">updated: ?</span>
+    </div>
+    <div class="grid">
+      <section class="panel">
+        <h3>Top Bots by Events (7d)</h3>
+        <canvas id="botChart" width="980" height="280"></canvas>
+      </section>
+      <section class="panel">
+        <h3>KPI Rates (7d)</h3>
+        <canvas id="kpiChart" width="980" height="280"></canvas>
+      </section>
+    </div>
+  </div>
+
+  <script>
+    const chipActive = document.getElementById("chipActive");
+    const chipRetention = document.getElementById("chipRetention");
+    const chipSuccess = document.getElementById("chipSuccess");
+    const chipEngagement = document.getElementById("chipEngagement");
+    const chipUpdated = document.getElementById("chipUpdated");
+    const botCanvas = document.getElementById("botChart");
+    const kpiCanvas = document.getElementById("kpiChart");
+
+    function pct(v) {
+      if (typeof v !== "number" || !Number.isFinite(v)) return "?";
+      return v.toFixed(1) + "%";
+    }
+
+    function drawBars(canvas, labels, values, opts = {}) {
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      const width = canvas.width;
+      const height = canvas.height;
+      const padLeft = 56;
+      const padRight = 20;
+      const padTop = 20;
+      const padBottom = 42;
+      const plotW = Math.max(10, width - padLeft - padRight);
+      const plotH = Math.max(10, height - padTop - padBottom);
+      const maxV = Math.max(1, ...values.map((v) => Number(v) || 0));
+      const count = Math.max(1, values.length);
+      const stepW = plotW / count;
+      const barW = Math.max(10, stepW * 0.62);
+
+      ctx.clearRect(0, 0, width, height);
+      ctx.fillStyle = "#0e1731";
+      ctx.fillRect(0, 0, width, height);
+
+      ctx.strokeStyle = "#2a3f6d";
+      ctx.lineWidth = 1;
+      for (let i = 0; i <= 4; i += 1) {
+        const y = padTop + (plotH * i / 4);
+        ctx.beginPath();
+        ctx.moveTo(padLeft, y);
+        ctx.lineTo(width - padRight, y);
+        ctx.stroke();
+      }
+      ctx.beginPath();
+      ctx.moveTo(padLeft, padTop);
+      ctx.lineTo(padLeft, height - padBottom);
+      ctx.lineTo(width - padRight, height - padBottom);
+      ctx.stroke();
+
+      ctx.font = "11px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif";
+      ctx.fillStyle = "#adc0ee";
+      ctx.textAlign = "right";
+      ctx.textBaseline = "middle";
+      for (let i = 0; i <= 4; i += 1) {
+        const val = Math.round(maxV - (maxV * i / 4));
+        const y = padTop + (plotH * i / 4);
+        ctx.fillText(String(val), padLeft - 8, y);
+      }
+
+      ctx.textAlign = "center";
+      ctx.textBaseline = "top";
+      for (let i = 0; i < count; i += 1) {
+        const value = Math.max(0, Number(values[i]) || 0);
+        const x = padLeft + (i * stepW) + ((stepW - barW) / 2);
+        const h = (value / maxV) * plotH;
+        const y = padTop + (plotH - h);
+        ctx.fillStyle = opts.barColor || "#4f7eff";
+        ctx.fillRect(x, y, barW, h);
+        ctx.fillStyle = "#edf3ff";
+        ctx.textBaseline = "bottom";
+        ctx.fillText(String(value), x + (barW / 2), y - 2);
+        ctx.fillStyle = "#c4d2f8";
+        ctx.textBaseline = "top";
+        const label = String(labels[i] || "").slice(0, 16);
+        ctx.fillText(label, x + (barW / 2), height - padBottom + 6);
+      }
+    }
+
+    async function loadEngagement() {
+      const resp = await fetch("/api/engagement?window_days=7&engaged_event_threshold=3&limit=10");
+      const data = await resp.json();
+      if (!resp.ok || data.status !== "ok") throw new Error("failed to load engagement");
+
+      const e = data.engagement || {};
+      const k = e.kpis || {};
+      const retention = k.retention_7d || {};
+      const success = k.success_rate_window || {};
+      const engagement = k.engagement_rate_window || {};
+      const bots = Array.isArray(e.bots) ? e.bots : [];
+
+      chipActive.textContent = "active_24h: " + String(k.active_agents_24h ?? "?");
+      chipRetention.textContent =
+        "retention_7d: " + pct(k.retention_7d_pct) +
+        " (" + String(retention.retained_agents ?? "?") + "/" + String(retention.previous_active_agents ?? "?") + ")";
+      chipSuccess.textContent =
+        "success_7d: " + pct(k.success_rate_window_pct) +
+        " (" + String(success.done_events ?? "?") + "/" + String(success.terminal_events ?? "?") + ")";
+      chipEngagement.textContent =
+        "engagement_7d: " + pct(k.engagement_rate_window_pct) +
+        " (" + String(engagement.engaged_agents ?? "?") + "/" + String(engagement.active_agents_window ?? "?") + ")";
+      chipUpdated.textContent = "updated: " + new Date().toLocaleTimeString();
+
+      const botLabels = bots.map((b) => String(b.bot_name || b.bot_id || "bot"));
+      const botValues = bots.map((b) => Number(b.events_count || 0));
+      drawBars(botCanvas, botLabels.length ? botLabels : ["no_data"], botValues.length ? botValues : [0], { barColor: "#4f7eff" });
+
+      const kpiLabels = ["Retention", "Success", "Engagement"];
+      const kpiValues = [
+        Math.round(Number(k.retention_7d_pct || 0)),
+        Math.round(Number(k.success_rate_window_pct || 0)),
+        Math.round(Number(k.engagement_rate_window_pct || 0)),
+      ];
+      drawBars(kpiCanvas, kpiLabels, kpiValues, { barColor: "#55c4a8" });
+    }
+
+    async function refresh() {
+      try {
+        await loadEngagement();
+      } catch (err) {
+        chipUpdated.textContent = "updated: error";
+      }
+    }
+
+    refresh();
+    setInterval(refresh, 30000);
   </script>
 </body>
 </html>
@@ -4891,6 +5663,156 @@ def create_app() -> Flask:
             }
         )
 
+    @app.route("/v1/health", methods=["GET"])
+    def v1_health():
+        return jsonify(
+            health_payload(
+                runtime_kind=runtime_kind,
+                runtime_version=runtime_version,
+                runtime_contract_version=runtime_contract_version,
+            )
+        )
+
+    @app.route("/v1/capabilities", methods=["GET"])
+    def v1_capabilities():
+        return jsonify(
+            capabilities_payload(
+                runtime_kind=runtime_kind,
+                runtime_version=runtime_version,
+                runtime_contract_version=runtime_contract_version,
+                max_tool_passes=runtime_max_tool_passes,
+                features={
+                    "web_search": bool(web_enabled_runtime),
+                    "web_fetch": bool(web_enabled_runtime),
+                    "mcp": bool(mcp_enabled_runtime),
+                    "telegram_webhook": True,
+                    "streaming": False,
+                    "shell": bool(shell_enabled_runtime),
+                },
+            )
+            | {"tools_protocol": runtime_tools_protocol}
+        )
+
+    @app.route("/v1/turn", methods=["POST"])
+    def v1_turn():
+        trace_id = str(request.headers.get("x-trace-id", "")).strip() or f"trace_{uuid.uuid4().hex}"
+        event_id = str(request.headers.get("x-event-id", "")).strip() or f"evt_{uuid.uuid4().hex}"
+        try:
+            payload = request.get_json(silent=True) or {}
+            turn_request = parse_turn_request(payload)
+        except ContractValidationError as exc:
+            return (
+                jsonify(
+                    turn_error_payload(
+                        runtime_kind=runtime_kind,
+                        runtime_version=runtime_version,
+                        runtime_contract_version=runtime_contract_version,
+                        trace_id=trace_id,
+                        event_id=event_id,
+                        error=str(exc),
+                    )
+                ),
+                400,
+            )
+
+        trace_id = turn_request.request_id or trace_id
+        event_id = turn_request.request_id or event_id
+
+        try:
+            bot = _require_bot(turn_request.tenant.bot_id)
+        except Exception as exc:
+            return (
+                jsonify(
+                    turn_error_payload(
+                        runtime_kind=runtime_kind,
+                        runtime_version=runtime_version,
+                        runtime_contract_version=runtime_contract_version,
+                        trace_id=trace_id,
+                        event_id=event_id,
+                        error=str(exc),
+                    )
+                ),
+                400,
+            )
+
+        selected_model = turn_request.model.model or str(bot.get("model", "")).strip() or default_model
+        session_id = turn_request.tenant.session_id
+        user_message = turn_request.user_message
+
+        # Queue-only planes return deterministic queued state envelope.
+        if service_mode != "all":
+            queued = _enqueue_chat_event(
+                bot_id=str(bot["bot_id"]),
+                session_id=session_id,
+                user_message=user_message,
+                selected_model=selected_model,
+                idempotency_key=turn_request.request_id,
+                source="runtime-v1",
+                source_path="/v1/turn",
+            )
+            return (
+                jsonify(
+                    {
+                        "ok": True,
+                        "status": "queued",
+                        "trace_id": trace_id,
+                        "event_id": str(queued.get("event_id", "")).strip() or event_id,
+                        "runtime_kind": runtime_kind,
+                        "runtime_version": runtime_version,
+                        "runtime_contract_version": runtime_contract_version,
+                    }
+                ),
+                202,
+            )
+
+        try:
+            state.append_session(
+                bot_id=str(bot["bot_id"]),
+                session_id=session_id,
+                role="user",
+                content=user_message,
+            )
+            turn_result = _run_contract_turn(
+                bot=bot,
+                session_id=session_id,
+                user_message=user_message,
+                selected_model=selected_model,
+                enabled_tools=turn_request.runtime_context.tool_policy.enabled_tools,
+                disabled_tools_policy=turn_request.runtime_context.tool_policy.disabled_tools,
+            )
+            assistant_message = str(turn_result.get("assistant_message", "")).strip()
+            state.append_session(
+                bot_id=str(bot["bot_id"]),
+                session_id=session_id,
+                role="assistant",
+                content=assistant_message,
+            )
+            return jsonify(
+                turn_success_payload(
+                    runtime_kind=runtime_kind,
+                    runtime_version=runtime_version,
+                    runtime_contract_version=runtime_contract_version,
+                    trace_id=trace_id,
+                    event_id=event_id,
+                    assistant_message=assistant_message,
+                    tool_trace=turn_result.get("tool_trace") or [],
+                )
+            )
+        except Exception as exc:
+            return (
+                jsonify(
+                    turn_error_payload(
+                        runtime_kind=runtime_kind,
+                        runtime_version=runtime_version,
+                        runtime_contract_version=runtime_contract_version,
+                        trace_id=trace_id,
+                        event_id=event_id,
+                        error=str(exc),
+                    )
+                ),
+                502,
+            )
+
     @app.route("/api/events", methods=["GET"])
     def events():
         bot_id = str(request.args.get("bot_id", "")).strip()
@@ -4929,6 +5851,41 @@ def create_app() -> Flask:
                 "queue_metrics": state.session_store.queue_metrics(),
                 "queue_policy": _queue_policy_snapshot(),
                 "autoscale": _autoscale_signals_snapshot(),
+            }
+        )
+
+    @app.route("/api/engagement", methods=["GET"])
+    def engagement():
+        window_days = _parse_optional_nonneg_int(request.args.get("window_days"), "window_days")
+        if window_days is None:
+            window_days = 7
+        if window_days < 1:
+            return jsonify({"status": "error", "error": "window_days must be >= 1"}), 400
+
+        limit = _parse_optional_nonneg_int(request.args.get("limit"), "limit")
+        if limit is None:
+            limit = 50
+        if limit < 1:
+            return jsonify({"status": "error", "error": "limit must be >= 1"}), 400
+
+        engaged_event_threshold = _parse_optional_nonneg_int(
+            request.args.get("engaged_event_threshold"),
+            "engaged_event_threshold",
+        )
+        if engaged_event_threshold is None:
+            engaged_event_threshold = 3
+        if engaged_event_threshold < 1:
+            return jsonify({"status": "error", "error": "engaged_event_threshold must be >= 1"}), 400
+
+        return jsonify(
+            {
+                "status": "ok",
+                "service_mode": service_mode,
+                "engagement": state.session_store.engagement_metrics(
+                    window_days=window_days,
+                    engaged_event_threshold=engaged_event_threshold,
+                    limit=limit,
+                ),
             }
         )
 

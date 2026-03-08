@@ -71,12 +71,17 @@ class SimpleAgentTests(unittest.TestCase):
             "SIMPLEAGENT_MCP_ENABLED",
             "SIMPLEAGENT_MCP_DISABLED_TOOLS",
             "SIMPLEAGENT_WEB_ENABLED",
+            "SIMPLEAGENT_SHELL_ENABLED",
             "SIMPLEAGENT_PUBLIC_BASE_URL",
             "SIMPLEAGENT_GATEWAY_TOOL_URL",
             "SIMPLEAGENT_SERVICE_MODE",
             "SIMPLEAGENT_EXECUTOR_AUTO_RUN",
             "SIMPLEAGENT_DELIVERY_AUTO_RUN",
             "SIMPLEAGENT_TELEGRAM_POLLER_ENABLED",
+            "SIMPLEAGENT_MAX_TOOL_PASSES",
+            "SIMPLEAGENT_MAX_TURN_SECONDS",
+            "SIMPLEAGENT_MAX_TOOL_CALL_SECONDS",
+            "SIMPLEAGENT_MAX_OUTPUT_CHARS",
             "SIMPLEAGENT_CHAT_SYNC_TIMEOUT_S",
             "SIMPLEAGENT_QUEUE_MAX_ATTEMPTS",
             "SIMPLEAGENT_QUEUE_RETRY_BASE_S",
@@ -128,6 +133,17 @@ class SimpleAgentTests(unittest.TestCase):
         self.assertIn("SimpleAgent Ops Dashboard", body)
         self.assertIn("/api/autoscale/signals", body)
         self.assertIn("/api/queue/dead-letter/purge", body)
+        self.assertIn("/api/engagement", body)
+
+    def test_engagement_dashboard_ui_serves(self):
+        app = self._make_app()
+        client = app.test_client()
+        resp = client.get("/engagement")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_data(as_text=True)
+        self.assertIn("Engagement Graphs", body)
+        self.assertIn("botChart", body)
+        self.assertIn("/api/engagement", body)
 
     def test_health_starts_with_zero_bots_and_masks_keys(self):
         app = self._make_app()
@@ -140,6 +156,105 @@ class SimpleAgentTests(unittest.TestCase):
         self.assertEqual(data["bots"], [])
         self.assertEqual(data["openai_api_key"], "test...3456")
         self.assertEqual(data["service_mode"], "all")
+
+    def test_v1_health_exposes_contract_metadata(self):
+        app = self._make_app()
+        client = app.test_client()
+        resp = client.get("/v1/health")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["runtime_contract_version"], "v1")
+        self.assertIn("runtime_kind", data)
+        self.assertIn("runtime_version", data)
+
+    def test_v1_capabilities_exposes_required_fields(self):
+        app = self._make_app()
+        client = app.test_client()
+        resp = client.get("/v1/capabilities")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertEqual(data["runtime_contract_version"], "v1")
+        self.assertEqual(data["tools_protocol"], "tool-tag-v1")
+        self.assertIn("features", data)
+        self.assertIn("max_tool_passes", data)
+        self.assertIn("runtime_kind", data)
+        self.assertIn("runtime_version", data)
+
+    @patch("app.subprocess.run")
+    @patch("app.requests.post")
+    def test_v1_turn_returns_tool_trace_for_shell_tool(self, mock_post, mock_subprocess_run):
+        os.environ["SIMPLEAGENT_SHELL_ENABLED"] = "1"
+        app = self._make_app()
+        client = app.test_client()
+        bot = self._create_bot(client)
+
+        mock_post.side_effect = [
+            _MockResp(
+                data={
+                    "choices": [
+                        {"message": {"content": "<tool:shell>echo hello</tool:shell>"}}
+                    ]
+                }
+            ),
+            _MockResp(
+                data={
+                    "choices": [
+                        {"message": {"content": "Done. Shell command completed."}}
+                    ]
+                }
+            ),
+        ]
+        mock_subprocess_run.return_value = subprocess.CompletedProcess(
+            args="echo hello",
+            returncode=0,
+            stdout="hello\n",
+            stderr="",
+        )
+
+        resp = client.post(
+            "/v1/turn",
+            json={
+                "request_id": "req_shell_1",
+                "deployment_id": "dep_shell_1",
+                "tenant": {"bot_id": bot["bot_id"], "session_id": "sess-v1-shell"},
+                "user_message": "run shell and confirm",
+                "model": {"provider": "openai", "model": "test-model"},
+                "runtime_context": {"tool_policy": {"enabled_tools": ["shell"], "disabled_tools": []}},
+                "runtime_contract_version": "v1",
+            },
+        )
+        self.assertEqual(resp.status_code, 200, msg=resp.get_data(as_text=True))
+        payload = resp.get_json()
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["runtime_contract_version"], "v1")
+        self.assertEqual(payload["assistant_message"], "Done. Shell command completed.")
+        self.assertEqual(len(payload["tool_trace"]), 1)
+        self.assertEqual(payload["tool_trace"][0]["tool"], "shell")
+        self.assertTrue(payload["tool_trace"][0]["ok"])
+        self.assertTrue(str(payload["tool_trace"][0]["call_id"]).startswith("tc_"))
+
+    def test_v1_turn_rejects_incompatible_contract_version(self):
+        app = self._make_app()
+        client = app.test_client()
+        bot = self._create_bot(client)
+
+        resp = client.post(
+            "/v1/turn",
+            json={
+                "request_id": "req_bad_contract",
+                "deployment_id": "dep_bad_contract",
+                "tenant": {"bot_id": bot["bot_id"], "session_id": "sess-bad-contract"},
+                "user_message": "hello",
+                "runtime_contract_version": "v2",
+            },
+        )
+        self.assertEqual(resp.status_code, 400, msg=resp.get_data(as_text=True))
+        payload = resp.get_json()
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["status"], "error")
+        self.assertIn("Unsupported runtime_contract_version", payload["error"])
 
     def test_livez_and_readyz_endpoints(self):
         app = self._make_app()
@@ -173,6 +288,24 @@ class SimpleAgentTests(unittest.TestCase):
         self.assertIn("counts", qm["inbound"])
         self.assertIn("queued_ready", qm["inbound"])
         self.assertIn("autoscale", data)
+
+    def test_engagement_endpoint_exposes_kpis_shape(self):
+        app = self._make_app()
+        client = app.test_client()
+        self._create_bot(client)
+
+        resp = client.get("/api/engagement?window_days=7&engaged_event_threshold=1&limit=10")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertEqual(data["status"], "ok")
+        self.assertIn("engagement", data)
+        engagement = data["engagement"]
+        self.assertIn("kpis", engagement)
+        self.assertIn("bots", engagement)
+        self.assertIn("active_agents_24h", engagement["kpis"])
+        self.assertIn("retention_7d_pct", engagement["kpis"])
+        self.assertIn("success_rate_window_pct", engagement["kpis"])
+        self.assertIn("engagement_rate_window_pct", engagement["kpis"])
 
     def test_autoscale_signals_reports_queued_ready_and_suggestion(self):
         os.environ["SIMPLEAGENT_SERVICE_MODE"] = "gateway"
