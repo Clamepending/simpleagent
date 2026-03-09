@@ -1,220 +1,173 @@
 # SimpleAgent
 
-SimpleAgent is a local-first AI chat service.
+SimpleAgent is an OSS multi-tenant agent runtime built for a queue-first serverless architecture.
 
-It receives chat messages, keeps per-session history in a local SQLite database, generates responses from an
-OpenAI-compatible endpoint, and can optionally forward assistant replies downstream.
+It supports:
+- a split runtime (`gateway`, `executor`, `telegram-poller`)
+- async queue + dead-letter recovery
+- explicit runtime contract endpoints (`/v1/health`, `/v1/capabilities`, `/v1/turn`)
+- `bot_id` tenant isolation across ingress, memory, tools, and delivery
 
-## Run Locally (recommended for fast iteration)
+## Why This Architecture
 
-`app.py` auto-loads `.env`, so local testing works without manual export.
+SimpleAgent is designed so ingress stays available while compute scales independently:
+- Gateway accepts requests and writes queue events quickly.
+- Executor and delivery workers are stateless and can scale from `0..N`.
+- Queue depth + lag metrics expose autoscaling signals.
+- Failures are retried with backoff and moved to dead-letter for replay/purge.
 
-1) Create/update `.env`:
+This is the current architecture implemented in `app.py` and split entrypoints.
 
-```bash
-PORT=18789
-SIMPLEAGENT_LLM_URL=http://127.0.0.1:11434/v1/chat/completions
-SIMPLEAGENT_MODEL=llama3.2
-SIMPLEAGENT_SERVICE_MODE=all
-SIMPLEAGENT_EXECUTOR_AUTO_RUN=0
-SIMPLEAGENT_DELIVERY_AUTO_RUN=0
-SIMPLEAGENT_TELEGRAM_POLLER_ENABLED=0
-SIMPLEAGENT_CHAT_SYNC_TIMEOUT_S=35
-SIMPLEAGENT_QUEUE_POLL_INTERVAL_MS=200
-SIMPLEAGENT_QUEUE_LOCK_TIMEOUT_S=120
-SIMPLEAGENT_QUEUE_MAX_ATTEMPTS=5
-SIMPLEAGENT_QUEUE_RETRY_BASE_S=2
-SIMPLEAGENT_QUEUE_RETRY_CAP_S=60
-SIMPLEAGENT_AUTOSCALE_INBOUND_TARGET_READY_PER_WORKER=20
-SIMPLEAGENT_AUTOSCALE_OUTBOUND_TARGET_READY_PER_WORKER=40
-SIMPLEAGENT_AUTOSCALE_EXECUTOR_MIN_WORKERS=0
-SIMPLEAGENT_AUTOSCALE_EXECUTOR_MAX_WORKERS=100
-SIMPLEAGENT_AUTOSCALE_DELIVERY_MIN_WORKERS=0
-SIMPLEAGENT_AUTOSCALE_DELIVERY_MAX_WORKERS=100
-SIMPLEAGENT_AUTOSCALE_MAX_STEP_UP=10
-SIMPLEAGENT_AUTOSCALE_MAX_STEP_DOWN=10
-OPENAI_API_KEY=replace-with-your-openai-api-key
-ANTHROPIC_API_KEY=
-GOOGLE_API_KEY=
-SIMPLEAGENT_LLM_API_KEY=
-SIMPLEAGENT_DB_PATH=./simpleagent.db
-SIMPLEAGENT_SHELL_ENABLED=0
-SIMPLEAGENT_WEB_ENABLED=1
-SIMPLEAGENT_SHELL_CWD=.
-SIMPLEAGENT_SHELL_TIMEOUT_S=20
-SIMPLEAGENT_SHELL_MAX_OUTPUT_CHARS=8000
-SIMPLEAGENT_SHELL_MAX_CALLS_PER_TURN=3
-SIMPLEAGENT_FORWARD_ENABLED=0
-SIMPLEAGENT_FORWARD_URL=http://127.0.0.1:8000/hooks/inbox
-SIMPLEAGENT_FORWARD_TOKEN=replace-with-your-downstream-api-key
-SIMPLEAGENT_TELEGRAM_POLL_TIMEOUT_S=25
-SIMPLEAGENT_TELEGRAM_POLL_RETRY_S=5
+## Current Serverless Runtime Topology
+
+```mermaid
+flowchart LR
+    C["Clients (UI / API / Hooks)"] --> G["Gateway Plane (HTTP ingress)"]
+    T["Telegram API"] --> P["Telegram Poller (optional)"]
+    P --> IQ["Inbound Queue"]
+    G --> IQ
+
+    IQ --> E["Executor Workers (0..N)"]
+    E --> TE["Turn Engine + Runtime Contract"]
+    TE --> LLM["Model Providers"]
+    TE --> TOOLS["Tools: MCP / Web / Gateway / Shell(optional)"]
+    E --> S["Session Store + Bot Config"]
+    E --> OQ["Outbound Queue"]
+
+    OQ --> D["Delivery Workers (0..N)"]
+    D --> T
+    D --> H["Webhook / Forward Targets"]
+
+    G --> OPS["Ops APIs (/api/metrics, /api/autoscale/*)"]
+    E --> OPS
 ```
 
-2) Start the app with `uv` (uses pinned dependencies from `uv.lock`):
+## Quick Start (Single Process)
+
+`app.py` auto-loads `.env` in the working directory.
+
+1. Install dependencies:
 
 ```bash
 uv sync --frozen
+```
+
+2. Create `.env` (minimal example):
+
+```bash
+PORT=18789
+SIMPLEAGENT_DB_PATH=./simpleagent.db
+SIMPLEAGENT_MODEL=gpt-4o-mini
+SIMPLEAGENT_SERVICE_MODE=all
+SIMPLEAGENT_WEB_ENABLED=1
+SIMPLEAGENT_SHELL_ENABLED=0
+OPENAI_API_KEY=replace-with-your-openai-api-key
+```
+
+3. Run:
+
+```bash
 uv run python app.py
 ```
 
-App URL: `http://localhost:18789`
+4. Open:
+- Chat UI: `http://127.0.0.1:18789/`
+- Ops UI: `http://127.0.0.1:18789/ops`
 
-## Run With Docker
+## Split Runtime Deployment (Serverless Style)
 
-If your downstream service is running on your laptop, use:
+Use separate processes with a shared DB:
 
-```bash
-docker compose --env-file .env.docker.example up --build
-```
+- Gateway: ingress only
+- Executor: queue drain + inference + tools + outbound delivery
+- Telegram poller: Telegram `getUpdates` adapter (optional)
 
-In Docker mode, `SIMPLEAGENT_FORWARD_URL` should usually use `host.docker.internal`.
-For a local model on your laptop, `SIMPLEAGENT_LLM_URL` should also use `host.docker.internal`.
+Entrypoints:
+- `python run_gateway.py`
+- `python run_executor.py`
+- `python run_telegram_poller.py`
 
-## Environment
-
-- `PORT` (default: `18789`)
-- `SIMPLEAGENT_LLM_URL` (OpenAI-compatible chat completions endpoint)
-- `SIMPLEAGENT_MODEL` (model name sent to LLM endpoint)
-- `SIMPLEAGENT_SERVICE_MODE` (`all`, `gateway`, or `executor`; default `all`)
-- `SIMPLEAGENT_EXECUTOR_AUTO_RUN` (default: `0` unless `SIMPLEAGENT_SERVICE_MODE=executor`; auto-start inbound executor worker loop)
-- `SIMPLEAGENT_DELIVERY_AUTO_RUN` (default: `0` unless `SIMPLEAGENT_SERVICE_MODE=executor`; auto-start outbound delivery worker loop)
-- `SIMPLEAGENT_TELEGRAM_POLLER_ENABLED` (default: `0`; enable gateway-plane Telegram long poller loop)
-- `SIMPLEAGENT_CHAT_SYNC_TIMEOUT_S` (default: `35`; gateway wait timeout when `wait_for_response=true`)
-- `SIMPLEAGENT_QUEUE_POLL_INTERVAL_MS` (default: `200`; queue worker idle poll interval)
-- `SIMPLEAGENT_QUEUE_LOCK_TIMEOUT_S` (default: `120`; stale processing lock timeout before automatic reclaim)
-- `SIMPLEAGENT_QUEUE_MAX_ATTEMPTS` (default: `5`; max processing attempts before dead-letter)
-- `SIMPLEAGENT_QUEUE_RETRY_BASE_S` (default: `2`; exponential retry backoff base in seconds)
-- `SIMPLEAGENT_QUEUE_RETRY_CAP_S` (default: `60`; max retry backoff in seconds)
-- `SIMPLEAGENT_AUTOSCALE_INBOUND_TARGET_READY_PER_WORKER` (default: `20`; inbound ready+processing load target per executor worker)
-- `SIMPLEAGENT_AUTOSCALE_OUTBOUND_TARGET_READY_PER_WORKER` (default: `40`; outbound ready+processing load target per delivery worker)
-- `SIMPLEAGENT_AUTOSCALE_EXECUTOR_MIN_WORKERS` / `SIMPLEAGENT_AUTOSCALE_EXECUTOR_MAX_WORKERS` (defaults: `0`/`100`)
-- `SIMPLEAGENT_AUTOSCALE_DELIVERY_MIN_WORKERS` / `SIMPLEAGENT_AUTOSCALE_DELIVERY_MAX_WORKERS` (defaults: `0`/`100`)
-- `SIMPLEAGENT_AUTOSCALE_MAX_STEP_UP` / `SIMPLEAGENT_AUTOSCALE_MAX_STEP_DOWN` (defaults: `10`/`10`; caps recommendation movement per decision)
-- `OPENAI_API_KEY` (primary key used for OpenAI models)
-- `ANTHROPIC_API_KEY` (used for Anthropic models)
-- `GOOGLE_API_KEY` (used for Google/Gemini models)
-- `SIMPLEAGENT_LLM_API_KEY` (fallback key name for OpenAI models; `ADMINAGENT_LLM_API_KEY` also accepted for migration)
-- `SIMPLEAGENT_DB_PATH` (default: `simpleagent.db`, local SQLite file for session memory)
-- `SIMPLEAGENT_SESSION_MAX_MESSAGES` (default: `100`, per-session retained messages)
-- `SIMPLEAGENT_SYSTEM_PROMPT` (optional system prompt)
-- `SIMPLEAGENT_SHELL_ENABLED` (default: `0`, enable model-requested shell commands; keep disabled for cloud multi-tenant deployments unless explicitly needed)
-- `SIMPLEAGENT_WEB_ENABLED` (default: `1`, enable built-in `web_search` and `web_fetch` tools)
-- `SIMPLEAGENT_WEB_MAX_CHARS` (default: `6000`, max extracted Markdown chars returned by `web_fetch`)
-- `SIMPLEAGENT_SHELL_CWD` (default: `.`, working directory for shell commands)
-- `SIMPLEAGENT_SHELL_TIMEOUT_S` (default: `20`, per-command timeout in seconds)
-- `SIMPLEAGENT_SHELL_MAX_OUTPUT_CHARS` (default: `8000`, max chars kept from stdout/stderr)
-- `SIMPLEAGENT_SHELL_MAX_CALLS_PER_TURN` (default: `3`, max shell commands per `/api/chat` turn)
-- `SIMPLEAGENT_FORWARD_ENABLED` (default: `0`)
-- `SIMPLEAGENT_FORWARD_URL` (optional downstream endpoint)
-- `SIMPLEAGENT_FORWARD_TOKEN` (optional Bearer token for downstream forwarding)
-- `SIMPLEAGENT_PUBLIC_BASE_URL` (optional public URL used by `get_callback_url()`; example `https://agent.example.com`)
-- `SIMPLEAGENT_TELEGRAM_POLL_TIMEOUT_S` (default: `25`, long poll timeout for `getUpdates`)
-- `SIMPLEAGENT_TELEGRAM_POLL_RETRY_S` (default: `5`, retry delay after polling errors)
-- Telegram token is configured per BOT via `/api/bots/<bot_id>/config` (or the web UI), not globally.
-
-## Endpoints
-
-- `GET /health`
-- `GET /livez` and `GET /readyz` (health probes)
-- `GET /api/livez` and `GET /api/readyz` (API aliases for probes)
-- `GET /api/events`
-- `POST /api/chat` (chat API with `session_id` + `message`)
-- `GET /api/sessions` (list known sessions from local DB)
-- `GET /api/sessions/<session_id>` (view persisted history for a session)
-- `POST /api/config/telegram` (update a bot's `telegram_bot_token` via API)
-- `POST /hooks/outward_inbox` (record external notifications into a session)
-- `GET /api/queue/stats` (inbound/outbound queue visibility)
-- `POST /api/queue/process-once` (executor-plane manual drain endpoint)
-- `GET /api/queue/dead-letter` (inspect failed events promoted to dead-letter)
-- `POST /api/queue/dead-letter/replay` (executor-plane replay of dead-letter events)
-- `POST /api/queue/dead-letter/purge` (executor-plane purge for dead-letter cleanup)
-- `GET /api/metrics` (queue lag + per-plane metrics for autoscaling signals)
-- `GET /api/autoscale/signals` (suggested executor/delivery worker counts + BOT_ID hot spots)
-- `GET|POST /api/autoscale/recommendation` (returns `scale_up`/`scale_down`/`hold` recommendations from current worker counts)
-
-The chat UI at `/` uses `/api/chat` and displays current model/forward config from `/health`.
-Ops UI is available at `/ops` for queue/dead-letter/autoscale testing.
-
-## Multi-User Architecture Plan
-
-See [docs/MULTI_USER_ARCHITECTURE_PLAN.md](docs/MULTI_USER_ARCHITECTURE_PLAN.md) for the BOT_ID-based separation between:
-- Gateway
-- Telegram poller
-- Executor
-- Database
-- MCP servers
-
-Operational playbook for split runtime incidents:
-- [docs/SPLIT_RUNTIME_RUNBOOK.md](docs/SPLIT_RUNTIME_RUNBOOK.md)
-
-## Split Deployment Modes
-
-Use a shared database and run separate processes:
-
-1) Gateway:
-- `SIMPLEAGENT_SERVICE_MODE=gateway`
-- Handles ingress (`/api/chat`, Telegram inbound/webhook, external hooks)
-- Queues inbound events with `bot_id`
-
-2) Executor:
-- `SIMPLEAGENT_SERVICE_MODE=executor`
-- Set `SIMPLEAGENT_EXECUTOR_AUTO_RUN=1`
-- Set `SIMPLEAGENT_DELIVERY_AUTO_RUN=1`
-- Consumes inbound queue, runs inference/tools, writes sessions, drains outbound queue
-
-3) Telegram poller (optional, can run on gateway process):
-- `SIMPLEAGENT_TELEGRAM_POLLER_ENABLED=1`
-- Polls tokens and enqueues Telegram events; no inference in poller path
-
-### Process Entrypoints
-
-- `python run_gateway.py`: gateway plane HTTP service (`SIMPLEAGENT_SERVICE_MODE=gateway`)
-- `python run_executor.py`: executor + outbound delivery workers (`SIMPLEAGENT_SERVICE_MODE=executor`)
-- `python run_telegram_poller.py`: dedicated Telegram poller worker (gateway mode, no HTTP server)
-
-All processes should share the same `SIMPLEAGENT_DB_PATH`.
-
-### Split Compose Example
-
-Use the provided split compose file:
+Docker split compose:
 
 ```bash
 docker compose -f docker-compose.split.yml --env-file .env up -d --build
 ```
 
 This starts:
-- `simpleagent-gateway` (HTTP ingress)
-- `simpleagent-executor` (inference + tool orchestration + outbound delivery)
-- `simpleagent-telegram-poller` (Telegram polling only)
+- `simpleagent-gateway`
+- `simpleagent-executor`
+- `simpleagent-telegram-poller`
 
-### Synthetic Queue Burst
+## Runtime Contract (for Control Planes)
 
-Use the helper script to generate queued chat load and observe autoscale signals:
+SimpleAgent exposes a stable runtime surface:
+- `GET /v1/health`
+- `GET /v1/capabilities`
+- `POST /v1/turn`
+
+Contract defaults:
+- `runtime_contract_version: v1`
+- `tools_protocol: tool-tag-v1`
+
+`/v1/turn` behavior:
+- `service_mode=all`: executes turn immediately and returns assistant output.
+- `service_mode=gateway|executor`: queues the turn and returns `202 status=queued`.
+
+## Core APIs
+
+### Bot + Chat
+- `POST /api/bots`, `GET /api/bots`, `GET /api/bots/<bot_id>`, `POST /api/bots/<bot_id>/config`
+- `POST /api/chat`
+- `GET /api/sessions`, `GET /api/sessions/<session_id>`, `DELETE /api/sessions/<session_id>`
+
+### Queue + Reliability
+- `GET /api/queue/stats`
+- `POST /api/queue/process-once`
+- `GET /api/queue/dead-letter`
+- `POST /api/queue/dead-letter/replay`
+- `POST /api/queue/dead-letter/purge`
+
+### Health + Autoscaling Signals
+- `GET /health`
+- `GET /livez`, `GET /readyz`, `GET /api/livez`, `GET /api/readyz`
+- `GET /api/metrics`
+- `GET /api/autoscale/signals`
+- `GET|POST /api/autoscale/recommendation`
+
+## Multi-Tenant Guardrails
+
+- `bot_id` is required for tenant-scoped ingress and execution.
+- Telegram bot token is unique across bots.
+- Telegram owner claim is immutable after first sender.
+- Queue/session records are scoped per `bot_id`.
+
+## Telegram
+
+1. Create a bot with `POST /api/bots`.
+2. Set `telegram_bot_token` via `POST /api/bots/<bot_id>/config`.
+3. Run with polling (`SIMPLEAGENT_TELEGRAM_POLLER_ENABLED=1`) or use webhook endpoints.
+4. Send messages to your Telegram bot.
+
+Session mapping format: `telegram:<chat_id>`.
+
+## Operations Docs
+
+- Architecture plan: [`docs/MULTI_USER_ARCHITECTURE_PLAN.md`](docs/MULTI_USER_ARCHITECTURE_PLAN.md)
+- Split runtime runbook: [`docs/SPLIT_RUNTIME_RUNBOOK.md`](docs/SPLIT_RUNTIME_RUNBOOK.md)
+- VM deploy notes: [`DEPLOY_VM.md`](DEPLOY_VM.md)
+
+## Load Test Helper
+
+Generate inbound queue load and inspect autoscale signals:
 
 ```bash
 python scripts/queue_burst.py --base-url http://127.0.0.1:18789 --requests 300 --concurrency 30 --sessions 30
 ```
 
-This prints JSON lines with enqueue throughput, `/api/autoscale/signals`, and `/api/queue/stats`.
+## Development
 
-## Telegram Setup
+Run tests:
 
-1) Create a bot via `/api/bots` (or from the web UI at `/`).
-2) Set that bot's `telegram_bot_token` via `/api/bots/<bot_id>/config`.
-3) Enable polling where needed with `SIMPLEAGENT_TELEGRAM_POLLER_ENABLED=1`.
-4) Start SimpleAgent and send a text message to your bot in Telegram.
-
-No public webhook URL is needed in long polling mode.
-
-SimpleAgent maps each Telegram chat to a session id in the form `telegram:<chat_id>`.
-
-## Chat Request Example
-
-```json
-{
-  "bot_id": "bot-123",
-  "session_id": "local-dev",
-  "message": "hello"
-}
+```bash
+uv run python -m unittest tests/test_simpleagent.py
 ```
