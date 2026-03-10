@@ -2182,6 +2182,16 @@ def create_app() -> Flask:
     anthropic_api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     google_api_key = os.getenv("GOOGLE_API_KEY", "").strip()
     gateway_token = os.getenv("GATEWAY_TOKEN", "").strip() or os.getenv("OPENCLAW_GATEWAY_TOKEN", "").strip()
+    # SimpleAgent now defaults to single-bot mode for OSS/OneClick parity.
+    # Set SIMPLEAGENT_FIXED_BOT_ID="" explicitly only if you need legacy multi-bot behavior.
+    fixed_bot_id_raw = _env_str_with_legacy("SIMPLEAGENT_FIXED_BOT_ID", "default").strip()
+    fixed_bot_id = _safe_bot_id(fixed_bot_id_raw) if fixed_bot_id_raw else ""
+    if fixed_bot_id_raw and not fixed_bot_id:
+        raise RuntimeError("SIMPLEAGENT_FIXED_BOT_ID is invalid after sanitization")
+    fixed_bot_mode_enabled = bool(fixed_bot_id)
+    fixed_bot_name = _env_str_with_legacy("SIMPLEAGENT_FIXED_BOT_NAME", "").strip() or fixed_bot_id
+    fixed_bot_model = _env_str_with_legacy("SIMPLEAGENT_FIXED_BOT_MODEL", "").strip() or default_model
+    fixed_bot_heartbeat_interval_s = max(1, _env_int_with_legacy("SIMPLEAGENT_FIXED_BOT_HEARTBEAT_S", 300))
     gateway_tool_url = _env_str_with_legacy("SIMPLEAGENT_GATEWAY_TOOL_URL", "").strip()
     bot_context_root = _env_str_with_legacy("SIMPLEAGENT_BOT_CONTEXT_DIR", "./bot_context").strip() or "./bot_context"
     service_mode_raw = _env_str_with_legacy("SIMPLEAGENT_SERVICE_MODE", "all").strip().lower() or "all"
@@ -2416,6 +2426,23 @@ def create_app() -> Flask:
             raise RuntimeError(f"bot_id '{clean_id}' was not found")
         _ensure_bot_context_files(clean_id)
         return bot
+
+    def _ensure_fixed_bot_exists() -> None:
+        if not fixed_bot_mode_enabled:
+            return
+        existing = state.session_store.get_bot(fixed_bot_id)
+        if existing:
+            _ensure_bot_context_files(fixed_bot_id)
+            return
+        created = state.session_store.create_bot(
+            bot_id=fixed_bot_id,
+            name=fixed_bot_name or fixed_bot_id,
+            model=fixed_bot_model or default_model,
+            heartbeat_interval_s=fixed_bot_heartbeat_interval_s,
+        )
+        _ensure_bot_context_files(str(created["bot_id"]))
+
+    _ensure_fixed_bot_exists()
 
     def _get_all_mcp_tools() -> List[Dict[str, Any]]:
         try:
@@ -4390,9 +4417,7 @@ def create_app() -> Flask:
         source_path: str,
         append_user_message: bool = True,
     ) -> Dict[str, Any]:
-        bot_id = _safe_bot_id(str(payload.get("bot_id", "")).strip())
-        if not bot_id:
-            raise RuntimeError("bot_id is required")
+        bot_id = _resolve_bot_id(str(payload.get("bot_id", "")).strip(), required=True)
         bot = _require_bot(bot_id)
         session_id = str(payload.get("session_id", "")).strip() or "default"
         user_message = str(payload.get("message", "")).strip()
@@ -4611,9 +4636,7 @@ def create_app() -> Flask:
                     append_user_message=append_user_message,
                 )
             elif event_type == "telegram_message":
-                bot_id = _safe_bot_id(str(payload.get("bot_id", "")).strip())
-                if not bot_id:
-                    raise RuntimeError("telegram_message event missing bot_id")
+                bot_id = _resolve_bot_id(str(payload.get("bot_id", "")).strip(), required=True)
                 message = payload.get("message")
                 if not isinstance(message, dict):
                     raise RuntimeError("telegram_message event missing message object")
@@ -4729,6 +4752,8 @@ def create_app() -> Flask:
                 time.sleep(queue_poll_interval_s)
                 continue
             bots = state.session_store.list_bots(limit=1000)
+            if fixed_bot_mode_enabled:
+                bots = [bot for bot in bots if str(bot.get("bot_id", "")).strip() == fixed_bot_id]
             did_work = False
             for bot in bots:
                 bot_id = str(bot.get("bot_id", "")).strip()
@@ -4777,12 +4802,19 @@ def create_app() -> Flask:
             if not did_work:
                 time.sleep(queue_poll_interval_s)
 
-    def _require_bot_id_from_request(data: Dict[str, Any], required: bool = True) -> str:
-        bot_id = str(data.get("bot_id", "")).strip() or str(request.args.get("bot_id", "")).strip()
-        clean_bot_id = _safe_bot_id(bot_id)
+    def _resolve_bot_id(raw_bot_id: str, required: bool = True) -> str:
+        clean_bot_id = _safe_bot_id(raw_bot_id)
+        if fixed_bot_mode_enabled:
+            if clean_bot_id and clean_bot_id != fixed_bot_id:
+                raise RuntimeError("bot_id is locked by server configuration")
+            return fixed_bot_id
         if required and not clean_bot_id:
             raise RuntimeError("bot_id is required")
         return clean_bot_id
+
+    def _require_bot_id_from_request(data: Dict[str, Any], required: bool = True) -> str:
+        bot_id = str(data.get("bot_id", "")).strip() or str(request.args.get("bot_id", "")).strip()
+        return _resolve_bot_id(bot_id, required=required)
 
     def _ensure_gateway_plane() -> None:
         if not gateway_plane_enabled:
@@ -5596,8 +5628,10 @@ def create_app() -> Flask:
     }
 
     const oneclickUiMode = uiMode === "oneclick";
-    const hideBotUi = oneclickUiMode || isTruthyParam("hide_bot_ui") || isTruthyParam("hide_bot_session");
-    const hideSessionUi = oneclickUiMode || isTruthyParam("hide_session_ui") || isTruthyParam("hide_bot_session");
+    let hideBotUi = oneclickUiMode || isTruthyParam("hide_bot_ui") || isTruthyParam("hide_bot_session");
+    let hideSessionUi = oneclickUiMode || isTruthyParam("hide_session_ui") || isTruthyParam("hide_bot_session");
+    let fixedBotModeEnabled = false;
+    let fixedBotId = "";
 
     const statusEl = document.getElementById("status");
     const chipRowEl = document.getElementById("chipRow");
@@ -5672,6 +5706,30 @@ def create_app() -> Flask:
     }
 
     applyUiMode();
+
+    async function loadUiConfig() {
+      try {
+        const resp = await fetch("/api/ui/config", { cache: "no-store" });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || "failed to load ui config");
+        const fixedMode = data.fixed_bot_mode || {};
+        if (fixedMode && fixedMode.enabled && String(fixedMode.bot_id || "").trim()) {
+          fixedBotModeEnabled = true;
+          fixedBotId = String(fixedMode.bot_id || "").trim();
+          selectedBotId = fixedBotId;
+          hideBotUi = true;
+          if (eventsScopedToBot) {
+            eventsScopedToBot.checked = true;
+            eventsScopedToBot.disabled = true;
+          }
+        }
+        if (data.hide_bot_ui_default) hideBotUi = true;
+        if (data.hide_session_ui_default) hideSessionUi = true;
+        applyUiMode();
+      } catch (err) {
+        addMessage("UI config load error: " + err, "error");
+      }
+    }
 
     function addMessage(text, cls) {
       const el = document.createElement("div");
@@ -6020,12 +6078,15 @@ def create_app() -> Flask:
       const data = await resp.json();
       if (!resp.ok) throw new Error(data.error || "failed to list bots");
 
-      const bots = Array.isArray(data.bots) ? data.bots : [];
+      let bots = Array.isArray(data.bots) ? data.bots : [];
+      if (fixedBotModeEnabled && fixedBotId) {
+        bots = bots.filter((b) => String((b || {}).bot_id || "") === fixedBotId);
+      }
       botSelectEl.innerHTML = "";
       if (!bots.length) {
         const option = document.createElement("option");
         option.value = "";
-        option.textContent = "No BOT_IDs yet";
+        option.textContent = fixedBotModeEnabled ? "Configured BOT_ID not found" : "No BOT_IDs yet";
         botSelectEl.appendChild(option);
         botSelectEl.disabled = true;
         selectedBotId = "";
@@ -6038,12 +6099,14 @@ def create_app() -> Flask:
         sessionListEl.innerHTML = "";
         setContextMeter(0, 0);
         contextMeterLabelEl.textContent = "context: -- / --";
-        setStatus("No bots yet. Create one to start chatting.");
+        setStatus(fixedBotModeEnabled ? "Configured BOT_ID is missing." : "No bots yet. Create one to start chatting.");
         return;
       }
-      botSelectEl.disabled = false;
+      botSelectEl.disabled = fixedBotModeEnabled;
 
-      if (preferredBotId && bots.some((b) => b.bot_id === preferredBotId)) {
+      if (fixedBotModeEnabled && fixedBotId && bots.some((b) => b.bot_id === fixedBotId)) {
+        selectedBotId = fixedBotId;
+      } else if (preferredBotId && bots.some((b) => b.bot_id === preferredBotId)) {
         selectedBotId = preferredBotId;
       } else if (!selectedBotId || !bots.some((b) => b.bot_id === selectedBotId)) {
         selectedBotId = bots[0].bot_id;
@@ -6357,6 +6420,11 @@ def create_app() -> Flask:
     }
 
     botSelectEl.addEventListener("change", async () => {
+      if (fixedBotModeEnabled) {
+        if (fixedBotId) botSelectEl.value = fixedBotId;
+        setChips();
+        return;
+      }
       const nextBotId = String(botSelectEl.value || "").trim();
       if (!nextBotId || nextBotId === selectedBotId) {
         setChips();
@@ -6374,6 +6442,10 @@ def create_app() -> Flask:
     });
 
     createBotBtn.addEventListener("click", async () => {
+      if (fixedBotModeEnabled) {
+        addMessage("Bot creation is disabled for this deployment.", "error");
+        return;
+      }
       try {
         const payload = {};
         const nameValue = (newBotNameInput.value || "").trim();
@@ -6606,9 +6678,10 @@ def create_app() -> Flask:
 
     (async () => {
       try {
+        await loadUiConfig();
         await loadProviderKeyState();
         setStatus("Loading bots...");
-        await loadBots("");
+        await loadBots(fixedBotModeEnabled ? fixedBotId : "");
         await loadToolsConfig();
         await loadEventsLog();
         setActiveTab("chat");
@@ -7443,6 +7516,8 @@ def create_app() -> Flask:
     @app.route("/health", methods=["GET"])
     def health():
         bots = state.session_store.list_bots(limit=200)
+        if fixed_bot_mode_enabled:
+            bots = [bot for bot in bots if str(bot.get("bot_id", "")).strip() == fixed_bot_id]
         return jsonify(
             {
                 "status": "ok",
@@ -7479,11 +7554,27 @@ def create_app() -> Flask:
                     "tools": _get_all_mcp_tools(),
                 },
                 "gateway_tool_url": gateway_tool_url,
+                "fixed_bot_mode": {"enabled": fixed_bot_mode_enabled, "bot_id": fixed_bot_id or None},
                 "queue": state.session_store.queue_stats(),
                 "queue_policy": _queue_policy_snapshot(),
                 "autoscale": _autoscale_signals_snapshot(),
                 "outward_inbox_callback_url": _get_callback_url(),
                 "sessions": state.snapshot().get("sessions"),
+            }
+        )
+
+    @app.route("/api/ui/config", methods=["GET"])
+    def ui_config():
+        return jsonify(
+            {
+                "status": "ok",
+                "ui_mode": "oneclick" if fixed_bot_mode_enabled else "default",
+                "fixed_bot_mode": {
+                    "enabled": fixed_bot_mode_enabled,
+                    "bot_id": fixed_bot_id or None,
+                },
+                "hide_bot_ui_default": fixed_bot_mode_enabled,
+                "hide_session_ui_default": False,
             }
         )
 
@@ -7543,7 +7634,8 @@ def create_app() -> Flask:
         event_id = turn_request.request_id or event_id
 
         try:
-            bot = _require_bot(turn_request.tenant.bot_id)
+            resolved_turn_bot_id = _resolve_bot_id(turn_request.tenant.bot_id, required=True)
+            bot = _require_bot(resolved_turn_bot_id)
         except Exception as exc:
             return (
                 jsonify(
@@ -7640,14 +7732,20 @@ def create_app() -> Flask:
     @app.route("/api/events", methods=["GET"])
     def events():
         bot_id = str(request.args.get("bot_id", "")).strip()
-        clean_bot_id = _safe_bot_id(bot_id) if bot_id else None
+        try:
+            clean_bot_id = _resolve_bot_id(bot_id, required=False)
+        except Exception as exc:
+            return jsonify({"status": "error", "error": str(exc)}), 400
+        if not clean_bot_id:
+            clean_bot_id = None
         return jsonify({"status": "ok", **state.snapshot(bot_id=clean_bot_id)})
 
     @app.route("/api/events/stream", methods=["GET"])
     def events_stream():
-        bot_id = _safe_bot_id(str(request.args.get("bot_id", "")).strip())
-        if not bot_id:
-            return jsonify({"status": "error", "error": "bot_id is required"}), 400
+        try:
+            bot_id = _resolve_bot_id(str(request.args.get("bot_id", "")).strip(), required=True)
+        except Exception as exc:
+            return jsonify({"status": "error", "error": str(exc)}), 400
         try:
             _require_bot(bot_id)
         except Exception as exc:
@@ -7810,7 +7908,10 @@ def create_app() -> Flask:
             parsed_limit = 100
         limit = max(1, min(500, parsed_limit))
         bot_id_raw = str(request.args.get("bot_id", "")).strip()
-        bot_id = _safe_bot_id(bot_id_raw) if bot_id_raw else ""
+        try:
+            bot_id = _resolve_bot_id(bot_id_raw, required=False)
+        except Exception as exc:
+            return jsonify({"status": "error", "error": str(exc)}), 400
         dead = state.session_store.list_dead_letter_events(queue=queue_kind, limit=limit, bot_id=bot_id or None)
         return jsonify(
             {
@@ -7832,7 +7933,10 @@ def create_app() -> Flask:
             return jsonify({"status": "error", "error": "JSON body is required"}), 400
         queue_kind = str(data.get("queue", "both")).strip().lower() or "both"
         bot_id_raw = str(data.get("bot_id", "")).strip()
-        bot_id = _safe_bot_id(bot_id_raw) if bot_id_raw else ""
+        try:
+            bot_id = _resolve_bot_id(bot_id_raw, required=False)
+        except Exception as exc:
+            return jsonify({"status": "error", "error": str(exc)}), 400
         ids_value = data.get("event_ids")
         event_ids: List[str] = []
         if isinstance(ids_value, list):
@@ -7877,7 +7981,10 @@ def create_app() -> Flask:
 
         queue_kind = str(data.get("queue", "both")).strip().lower() or "both"
         bot_id_raw = str(data.get("bot_id", "")).strip()
-        bot_id = _safe_bot_id(bot_id_raw) if bot_id_raw else ""
+        try:
+            bot_id = _resolve_bot_id(bot_id_raw, required=False)
+        except Exception as exc:
+            return jsonify({"status": "error", "error": str(exc)}), 400
         ids_value = data.get("event_ids")
         event_ids: List[str] = []
         if isinstance(ids_value, list):
@@ -7969,11 +8076,17 @@ def create_app() -> Flask:
 
     @app.route("/api/bots", methods=["GET"])
     def list_bots():
-        bots = state.session_store.list_bots(limit=500)
+        if fixed_bot_mode_enabled:
+            bot = _require_bot(fixed_bot_id)
+            bots = [bot]
+        else:
+            bots = state.session_store.list_bots(limit=500)
         return jsonify({"status": "ok", "bots": [_mask_bot(bot) for bot in bots]})
 
     @app.route("/api/bots", methods=["POST"])
     def create_bot_endpoint():
+        if fixed_bot_mode_enabled:
+            return jsonify({"status": "error", "error": "bot creation is disabled for this deployment"}), 403
         data = request.get_json(silent=True) or {}
         if not isinstance(data, dict):
             return jsonify({"status": "error", "error": "JSON body is required"}), 400
@@ -8006,7 +8119,8 @@ def create_app() -> Flask:
     @app.route("/api/bots/<bot_id>", methods=["GET"])
     def get_bot_endpoint(bot_id: str):
         try:
-            bot = _require_bot(bot_id)
+            resolved_bot_id = _resolve_bot_id(bot_id, required=True)
+            bot = _require_bot(resolved_bot_id)
             return jsonify({"status": "ok", "bot": _mask_bot(bot)})
         except Exception as exc:
             return jsonify({"status": "error", "error": str(exc)}), 404
@@ -8018,9 +8132,10 @@ def create_app() -> Flask:
             return jsonify({"status": "error", "error": "JSON body is required"}), 400
 
         try:
-            _require_bot(bot_id)
+            resolved_bot_id = _resolve_bot_id(bot_id, required=True)
+            _require_bot(resolved_bot_id)
             updated = state.session_store.update_bot(
-                bot_id=bot_id,
+                bot_id=resolved_bot_id,
                 name=data.get("name") if "name" in data else None,
                 model=data.get("model") if "model" in data else None,
                 telegram_bot_token=data.get("telegram_bot_token") if "telegram_bot_token" in data else None,
@@ -8036,16 +8151,17 @@ def create_app() -> Flask:
     @app.route("/api/bots/<bot_id>/context", methods=["GET"])
     def get_bot_context_endpoint(bot_id: str):
         try:
-            _require_bot(bot_id)
-            files = _load_bot_context(_safe_bot_id(bot_id))
-            return jsonify({"status": "ok", "bot_id": _safe_bot_id(bot_id), "files": files})
+            resolved_bot_id = _resolve_bot_id(bot_id, required=True)
+            _require_bot(resolved_bot_id)
+            files = _load_bot_context(resolved_bot_id)
+            return jsonify({"status": "ok", "bot_id": resolved_bot_id, "files": files})
         except Exception as exc:
             return jsonify({"status": "error", "error": str(exc)}), 404
 
     @app.route("/api/bots/<bot_id>/context/<file_name>", methods=["GET", "POST"])
     def bot_context_file_endpoint(bot_id: str, file_name: str):
         try:
-            clean_bot_id = _safe_bot_id(bot_id)
+            clean_bot_id = _resolve_bot_id(bot_id, required=True)
             _require_bot(clean_bot_id)
             try:
                 clean_name = _normalize_context_name(file_name)
@@ -8066,7 +8182,7 @@ def create_app() -> Flask:
     @app.route("/api/bots/<bot_id>/heartbeat", methods=["GET", "POST"])
     def bot_heartbeat_endpoint(bot_id: str):
         try:
-            clean_bot_id = _safe_bot_id(bot_id)
+            clean_bot_id = _resolve_bot_id(bot_id, required=True)
             bot = _require_bot(clean_bot_id)
             if request.method == "GET":
                 content = _read_bot_context_file(clean_bot_id, "HEARTBEAT.md")
@@ -8209,9 +8325,10 @@ def create_app() -> Flask:
                 return jsonify({"status": "error", "error": "unauthorized"}), 401
 
         payload = request.get_json(silent=True) or {}
-        bot_id = _safe_bot_id(str(payload.get("bot_id", "")).strip())
-        if not bot_id:
-            return jsonify({"status": "error", "error": "bot_id is required"}), 400
+        try:
+            bot_id = _resolve_bot_id(str(payload.get("bot_id", "")).strip(), required=True)
+        except Exception as exc:
+            return jsonify({"status": "error", "error": str(exc)}), 400
         try:
             bot = _require_bot(bot_id)
         except Exception as exc:
@@ -8299,9 +8416,10 @@ def create_app() -> Flask:
             raw_text = (request.get_data(as_text=True) or "").strip()
             payload = {"raw": _truncate_text(raw_text, 8000)} if raw_text else {}
 
-        bot_id = _safe_bot_id(str(payload.get("bot_id", "")).strip())
-        if not bot_id:
-            return jsonify({"status": "error", "error": "bot_id is required"}), 400
+        try:
+            bot_id = _resolve_bot_id(str(payload.get("bot_id", "")).strip(), required=True)
+        except Exception as exc:
+            return jsonify({"status": "error", "error": str(exc)}), 400
         try:
             bot = _require_bot(bot_id)
         except Exception as exc:
@@ -8383,9 +8501,10 @@ def create_app() -> Flask:
         session_id = session_id.strip()
         if not session_id:
             return jsonify({"status": "error", "error": "session_id is required"}), 400
-        bot_id = _safe_bot_id(str(request.args.get("bot_id", "")).strip())
-        if not bot_id:
-            return jsonify({"status": "error", "error": "bot_id is required"}), 400
+        try:
+            bot_id = _resolve_bot_id(str(request.args.get("bot_id", "")).strip(), required=True)
+        except Exception as exc:
+            return jsonify({"status": "error", "error": str(exc)}), 400
         try:
             _require_bot(bot_id)
         except Exception as exc:
@@ -8397,9 +8516,10 @@ def create_app() -> Flask:
         session_id = session_id.strip()
         if not session_id:
             return jsonify({"status": "error", "error": "session_id is required"}), 400
-        bot_id = _safe_bot_id(str(request.args.get("bot_id", "")).strip())
-        if not bot_id:
-            return jsonify({"status": "error", "error": "bot_id is required"}), 400
+        try:
+            bot_id = _resolve_bot_id(str(request.args.get("bot_id", "")).strip(), required=True)
+        except Exception as exc:
+            return jsonify({"status": "error", "error": str(exc)}), 400
         try:
             _require_bot(bot_id)
         except Exception as exc:
@@ -8409,9 +8529,10 @@ def create_app() -> Flask:
 
     @app.route("/api/sessions", methods=["GET"])
     def list_sessions():
-        bot_id = _safe_bot_id(str(request.args.get("bot_id", "")).strip())
-        if not bot_id:
-            return jsonify({"status": "error", "error": "bot_id is required"}), 400
+        try:
+            bot_id = _resolve_bot_id(str(request.args.get("bot_id", "")).strip(), required=True)
+        except Exception as exc:
+            return jsonify({"status": "error", "error": str(exc)}), 400
         try:
             _require_bot(bot_id)
         except Exception as exc:
@@ -8464,9 +8585,10 @@ def create_app() -> Flask:
         data = request.get_json(silent=True) or {}
         if not isinstance(data, dict):
             return jsonify({"status": "error", "error": "JSON body is required"}), 400
-        bot_id = _safe_bot_id(str(data.get("bot_id", "")).strip())
-        if not bot_id:
-            return jsonify({"status": "error", "error": "bot_id is required"}), 400
+        try:
+            bot_id = _resolve_bot_id(str(data.get("bot_id", "")).strip(), required=True)
+        except Exception as exc:
+            return jsonify({"status": "error", "error": str(exc)}), 400
         token = str(data.get("telegram_bot_token", "")).strip()
         try:
             updated = state.session_store.update_bot(bot_id=bot_id, telegram_bot_token=token)
@@ -8504,13 +8626,12 @@ def create_app() -> Flask:
             if next_google_api_key:
                 google_api_key = next_google_api_key
 
-        if "bot_id" in data and "telegram_bot_token" in data:
-            bot_id = _safe_bot_id(str(data.get("bot_id", "")).strip())
-            if bot_id:
-                try:
-                    state.session_store.update_bot(bot_id=bot_id, telegram_bot_token=str(data.get("telegram_bot_token", "")).strip())
-                except Exception as exc:
-                    return jsonify({"status": "error", "error": str(exc)}), 400
+        if "telegram_bot_token" in data:
+            try:
+                bot_id = _resolve_bot_id(str(data.get("bot_id", "")).strip(), required=True)
+                state.session_store.update_bot(bot_id=bot_id, telegram_bot_token=str(data.get("telegram_bot_token", "")).strip())
+            except Exception as exc:
+                return jsonify({"status": "error", "error": str(exc)}), 400
 
         os.environ["OPENAI_API_KEY"] = openai_api_key
         os.environ["ANTHROPIC_API_KEY"] = anthropic_api_key
@@ -8550,7 +8671,7 @@ def create_app() -> Flask:
             except ValueError:
                 update_id = None
         try:
-            clean_bot_id = _safe_bot_id(bot_id)
+            clean_bot_id = _resolve_bot_id(bot_id, required=True)
             event = _enqueue_telegram_event(
                 bot_id=clean_bot_id,
                 message=message,
@@ -8589,9 +8710,10 @@ def create_app() -> Flask:
         if not isinstance(payload, dict):
             return jsonify({"status": "error", "error": "JSON body is required"}), 400
 
-        bot_id = _safe_bot_id(str(payload.get("bot_id", "")).strip())
-        if not bot_id:
-            return jsonify({"status": "error", "error": "bot_id is required"}), 400
+        try:
+            bot_id = _resolve_bot_id(str(payload.get("bot_id", "")).strip(), required=True)
+        except Exception as exc:
+            return jsonify({"status": "error", "error": str(exc)}), 400
 
         update = payload.get("update")
         message = payload.get("message")

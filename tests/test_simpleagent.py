@@ -54,7 +54,12 @@ class SimpleAgentTests(unittest.TestCase):
         os.environ.pop("SIMPLEAGENT_FORWARD_URL", None)
         os.environ.pop("SIMPLEAGENT_FORWARD_TOKEN", None)
         os.environ.pop("SIMPLEAGENT_GATEWAY_TOOL_URL", None)
+        os.environ.pop("SIMPLEAGENT_FIXED_BOT_ID", None)
+        os.environ.pop("SIMPLEAGENT_FIXED_BOT_NAME", None)
+        os.environ.pop("SIMPLEAGENT_FIXED_BOT_MODEL", None)
+        os.environ.pop("SIMPLEAGENT_FIXED_BOT_HEARTBEAT_S", None)
         os.environ.pop("GATEWAY_TOKEN", None)
+        os.environ.pop("OPENCLAW_GATEWAY_TOKEN", None)
 
     def tearDown(self):
         self._tmpdir.cleanup()
@@ -74,6 +79,10 @@ class SimpleAgentTests(unittest.TestCase):
             "SIMPLEAGENT_SHELL_ENABLED",
             "SIMPLEAGENT_PUBLIC_BASE_URL",
             "SIMPLEAGENT_GATEWAY_TOOL_URL",
+            "SIMPLEAGENT_FIXED_BOT_ID",
+            "SIMPLEAGENT_FIXED_BOT_NAME",
+            "SIMPLEAGENT_FIXED_BOT_MODEL",
+            "SIMPLEAGENT_FIXED_BOT_HEARTBEAT_S",
             "SIMPLEAGENT_SERVICE_MODE",
             "SIMPLEAGENT_EXECUTOR_AUTO_RUN",
             "SIMPLEAGENT_DELIVERY_AUTO_RUN",
@@ -96,6 +105,7 @@ class SimpleAgentTests(unittest.TestCase):
             "SIMPLEAGENT_AUTOSCALE_MAX_STEP_UP",
             "SIMPLEAGENT_AUTOSCALE_MAX_STEP_DOWN",
             "GATEWAY_TOKEN",
+            "OPENCLAW_GATEWAY_TOKEN",
         ]:
             os.environ.pop(key, None)
 
@@ -109,11 +119,43 @@ class SimpleAgentTests(unittest.TestCase):
     def _create_bot(self, client, **overrides):
         payload = {"name": "bot-a", "model": "test-model"}
         payload.update(overrides)
-        resp = client.post("/api/bots", json=payload)
-        self.assertEqual(resp.status_code, 200, msg=resp.get_data(as_text=True))
-        data = resp.get_json()
-        self.assertEqual(data["status"], "ok")
-        return data["bot"]
+        gateway_token = os.environ.get("GATEWAY_TOKEN", "").strip() or os.environ.get("OPENCLAW_GATEWAY_TOKEN", "").strip()
+        headers = {"Authorization": f"Bearer {gateway_token}"} if gateway_token else None
+        resp = client.post("/api/bots", json=payload, headers=headers)
+        if resp.status_code == 200:
+            data = resp.get_json()
+            self.assertEqual(data["status"], "ok")
+            return data["bot"]
+
+        data = resp.get_json() or {}
+        if resp.status_code != 403 or "disabled" not in str(data.get("error", "")).lower():
+            self.fail(f"Unexpected bot create response: {resp.status_code} {resp.get_data(as_text=True)}")
+
+        listed = client.get("/api/bots", headers=headers)
+        self.assertEqual(listed.status_code, 200, msg=listed.get_data(as_text=True))
+        bots = (listed.get_json() or {}).get("bots") or []
+        self.assertTrue(bots, "single-bot mode should always expose one bot")
+        bot = bots[0]
+        bot_id = str(bot.get("bot_id", "")).strip()
+        self.assertTrue(bot_id)
+
+        config_payload = {}
+        if "name" in payload:
+            config_payload["name"] = payload["name"]
+        if "model" in payload:
+            config_payload["model"] = payload["model"]
+        if "telegram_bot_token" in payload:
+            config_payload["telegram_bot_token"] = payload["telegram_bot_token"]
+        if "heartbeat_interval_s" in payload:
+            config_payload["heartbeat_interval_s"] = payload["heartbeat_interval_s"]
+
+        if config_payload:
+            upd = client.post(f"/api/bots/{bot_id}/config", json=config_payload, headers=headers)
+            self.assertEqual(upd.status_code, 200, msg=upd.get_data(as_text=True))
+
+        resolved = client.get(f"/api/bots/{bot_id}", headers=headers)
+        self.assertEqual(resolved.status_code, 200, msg=resolved.get_data(as_text=True))
+        return resolved.get_json()["bot"]
 
     def test_root_serves_chat_ui(self):
         app = self._make_app()
@@ -158,15 +200,15 @@ class SimpleAgentTests(unittest.TestCase):
         self.assertIn("botChart", body)
         self.assertIn("/api/engagement", body)
 
-    def test_health_starts_with_zero_bots_and_masks_keys(self):
+    def test_health_reports_single_default_bot_and_masks_keys(self):
         app = self._make_app()
         client = app.test_client()
         resp = client.get("/health")
         self.assertEqual(resp.status_code, 200)
         data = resp.get_json()
         self.assertEqual(data["status"], "ok")
-        self.assertEqual(data["bot_count"], 0)
-        self.assertEqual(data["bots"], [])
+        self.assertEqual(data["bot_count"], 1)
+        self.assertEqual(len(data["bots"]), 1)
         self.assertEqual(data["openai_api_key"], "test...3456")
         self.assertEqual(data["service_mode"], "all")
 
@@ -412,7 +454,7 @@ class SimpleAgentTests(unittest.TestCase):
         app = self._make_app()
         client = app.test_client()
         bot = self._create_bot(client)
-        self.assertTrue(bot["bot_id"].startswith("bot-"))
+        self.assertTrue(bool(bot["bot_id"]))
         self.assertEqual(bot["name"], "bot-a")
         self.assertEqual(bot["model"], "test-model")
 
@@ -427,13 +469,14 @@ class SimpleAgentTests(unittest.TestCase):
         app = self._make_app()
         client = app.test_client()
         first = client.post("/api/bots", json={"bot_id": "bot-fixed", "name": "A", "model": "test-model"})
-        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.status_code, 403)
+        self.assertIn("disabled", first.get_json()["error"].lower())
 
         second = client.post("/api/bots", json={"bot_id": "bot-fixed", "name": "B", "model": "test-model"})
-        self.assertEqual(second.status_code, 409)
-        self.assertIn("already exists", second.get_json()["error"].lower())
+        self.assertEqual(second.status_code, 403)
+        self.assertIn("disabled", second.get_json()["error"].lower())
 
-    def test_duplicate_telegram_token_across_bots_is_blocked(self):
+    def test_single_bot_mode_returns_same_bot_on_recreate_attempt(self):
         app = self._make_app()
         client = app.test_client()
         bot1 = self._create_bot(client, name="one")
@@ -443,8 +486,8 @@ class SimpleAgentTests(unittest.TestCase):
         self.assertEqual(upd1.status_code, 200)
 
         upd2 = client.post(f"/api/bots/{bot2['bot_id']}/config", json={"telegram_bot_token": "123456:ABCDEF"})
-        self.assertEqual(upd2.status_code, 409)
-        self.assertIn("already linked", upd2.get_json()["error"]) 
+        self.assertEqual(upd2.status_code, 200)
+        self.assertEqual(bot1["bot_id"], bot2["bot_id"])
 
     @patch("app.requests.post")
     def test_chat_requires_bot_id(self, mock_post):
@@ -452,8 +495,60 @@ class SimpleAgentTests(unittest.TestCase):
         app = self._make_app()
         client = app.test_client()
         resp = client.post("/api/chat", json={"session_id": "s1", "message": "hello"})
-        self.assertEqual(resp.status_code, 400)
-        self.assertIn("bot_id is required", resp.get_json()["error"])
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("bot_id", resp.get_json())
+
+    @patch("app.requests.post")
+    def test_fixed_bot_mode_allows_chat_without_bot_id_and_blocks_cross_bot(self, mock_post):
+        os.environ["SIMPLEAGENT_FIXED_BOT_ID"] = "fixed-main"
+        os.environ["SIMPLEAGENT_FIXED_BOT_NAME"] = "Fixed Main"
+        os.environ["SIMPLEAGENT_FIXED_BOT_MODEL"] = "test-model"
+        mock_post.return_value = _MockResp(data={"choices": [{"message": {"content": "fixed reply"}}]})
+
+        app = self._make_app()
+        client = app.test_client()
+
+        ui_cfg = client.get("/api/ui/config")
+        self.assertEqual(ui_cfg.status_code, 200)
+        self.assertTrue(ui_cfg.get_json()["fixed_bot_mode"]["enabled"])
+        self.assertEqual(ui_cfg.get_json()["fixed_bot_mode"]["bot_id"], "fixed-main")
+
+        list_resp = client.get("/api/bots")
+        self.assertEqual(list_resp.status_code, 200)
+        bots = list_resp.get_json()["bots"]
+        self.assertEqual(len(bots), 1)
+        self.assertEqual(bots[0]["bot_id"], "fixed-main")
+
+        blocked_create = client.post("/api/bots", json={"bot_id": "another", "name": "Another", "model": "test-model"})
+        self.assertEqual(blocked_create.status_code, 403)
+
+        blocked_cross = client.post("/api/chat", json={"bot_id": "another", "session_id": "s-fixed", "message": "hello"})
+        self.assertEqual(blocked_cross.status_code, 400)
+        self.assertIn("locked", blocked_cross.get_json()["error"].lower())
+
+        ok_chat = client.post("/api/chat", json={"session_id": "s-fixed", "message": "hello"})
+        self.assertEqual(ok_chat.status_code, 200, msg=ok_chat.get_data(as_text=True))
+        self.assertEqual(ok_chat.get_json()["bot_id"], "fixed-main")
+
+    @patch("app.requests.post")
+    def test_fixed_bot_mode_sessions_endpoints_do_not_require_bot_query(self, mock_post):
+        os.environ["SIMPLEAGENT_FIXED_BOT_ID"] = "fixed-main"
+        mock_post.return_value = _MockResp(data={"choices": [{"message": {"content": "fixed reply"}}]})
+
+        app = self._make_app()
+        client = app.test_client()
+
+        chat = client.post("/api/chat", json={"session_id": "sess-fixed", "message": "hello"})
+        self.assertEqual(chat.status_code, 200, msg=chat.get_data(as_text=True))
+
+        sessions = client.get("/api/sessions")
+        self.assertEqual(sessions.status_code, 200, msg=sessions.get_data(as_text=True))
+        self.assertEqual(sessions.get_json()["bot_id"], "fixed-main")
+
+        history = client.get("/api/sessions/sess-fixed")
+        self.assertEqual(history.status_code, 200, msg=history.get_data(as_text=True))
+        self.assertEqual(history.get_json()["bot_id"], "fixed-main")
+        self.assertEqual(len(history.get_json()["history"]), 2)
 
     def test_chat_requires_message(self):
         app = self._make_app()
@@ -516,25 +611,24 @@ class SimpleAgentTests(unittest.TestCase):
         self.assertLessEqual(payload["usage_ratio"], 1)
 
     @patch("app.requests.post")
-    def test_chat_isolation_same_session_id_across_bots(self, mock_post):
+    def test_chat_same_session_id_keeps_messages_in_single_bot_mode(self, mock_post):
         mock_post.side_effect = [
             _MockResp(data={"choices": [{"message": {"content": "A-reply"}}]}),
             _MockResp(data={"choices": [{"message": {"content": "B-reply"}}]}),
         ]
         app = self._make_app()
         client = app.test_client()
-        bot_a = self._create_bot(client, name="A")
-        bot_b = self._create_bot(client, name="B")
+        bot = self._create_bot(client, name="A")
 
-        r1 = client.post("/api/chat", json={"bot_id": bot_a["bot_id"], "session_id": "shared", "message": "hello A"})
-        r2 = client.post("/api/chat", json={"bot_id": bot_b["bot_id"], "session_id": "shared", "message": "hello B"})
+        r1 = client.post("/api/chat", json={"bot_id": bot["bot_id"], "session_id": "shared", "message": "hello A"})
+        r2 = client.post("/api/chat", json={"bot_id": bot["bot_id"], "session_id": "shared", "message": "hello B"})
         self.assertEqual(r1.status_code, 200)
         self.assertEqual(r2.status_code, 200)
 
-        h1 = client.get(f"/api/sessions/shared?bot_id={bot_a['bot_id']}").get_json()["history"]
-        h2 = client.get(f"/api/sessions/shared?bot_id={bot_b['bot_id']}").get_json()["history"]
-        self.assertEqual(h1[1]["content"], "A-reply")
-        self.assertEqual(h2[1]["content"], "B-reply")
+        history = client.get(f"/api/sessions/shared?bot_id={bot['bot_id']}").get_json()["history"]
+        self.assertEqual(len(history), 4)
+        self.assertEqual(history[1]["content"], "A-reply")
+        self.assertEqual(history[3]["content"], "B-reply")
 
     @patch("app.requests.post")
     def test_session_history_persists_across_app_instances(self, mock_post):
@@ -578,9 +672,9 @@ class SimpleAgentTests(unittest.TestCase):
     def test_sessions_endpoints_require_bot_id(self):
         app = self._make_app()
         client = app.test_client()
-        self.assertEqual(client.get("/api/sessions").status_code, 400)
-        self.assertEqual(client.get("/api/sessions/x").status_code, 400)
-        self.assertEqual(client.delete("/api/sessions/x").status_code, 400)
+        self.assertEqual(client.get("/api/sessions").status_code, 200)
+        self.assertEqual(client.get("/api/sessions/x").status_code, 200)
+        self.assertEqual(client.delete("/api/sessions/x").status_code, 200)
 
     @patch("app.requests.post")
     def test_forwards_when_enabled_and_includes_bot_id(self, mock_post):
@@ -1116,7 +1210,7 @@ class SimpleAgentTests(unittest.TestCase):
         bot = self._create_bot(client)
 
         missing = client.post("/hooks/outward_inbox", json={"source": "x", "message": "y"})
-        self.assertEqual(missing.status_code, 400)
+        self.assertEqual(missing.status_code, 200)
 
         resp = client.post(
             "/hooks/outward_inbox",
@@ -1155,7 +1249,7 @@ class SimpleAgentTests(unittest.TestCase):
             json={"io_id": "cam-1"},
             headers={"Authorization": "Bearer gw-secret"},
         )
-        self.assertEqual(missing_bot.status_code, 400)
+        self.assertEqual(missing_bot.status_code, 200)
 
         ok = client.post(
             "/hooks/videomemory-alert",
@@ -1168,7 +1262,10 @@ class SimpleAgentTests(unittest.TestCase):
         self.assertEqual(payload["session_id"], "hook:videomemory:cam-1:t-1:vm-1")
         self.assertEqual(payload["response"], "video handled")
 
-        hist = client.get(f"/api/sessions/hook:videomemory:cam-1:t-1:vm-1?bot_id={bot['bot_id']}").get_json()
+        hist = client.get(
+            f"/api/sessions/hook:videomemory:cam-1:t-1:vm-1?bot_id={bot['bot_id']}",
+            headers={"Authorization": "Bearer gw-secret"},
+        ).get_json()
         self.assertEqual(hist["status"], "ok")
         self.assertEqual(len(hist["history"]), 2)
         self.assertIn("VideoMemory alert on cam-1 task t-1: motion", hist["history"][0]["content"])
@@ -1438,8 +1535,8 @@ class SimpleAgentTests(unittest.TestCase):
         app = self._make_app()
         client = app.test_client()
         resp = client.post("/api/queue/dead-letter/purge", json={"queue": "both"})
-        self.assertEqual(resp.status_code, 400)
-        self.assertIn("allow_all", resp.get_json()["error"])
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["status"], "ok")
 
     def test_gateway_mode_metrics_show_queued_inbound_age(self):
         os.environ["SIMPLEAGENT_SERVICE_MODE"] = "gateway"
