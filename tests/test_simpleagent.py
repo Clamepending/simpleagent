@@ -123,6 +123,19 @@ class SimpleAgentTests(unittest.TestCase):
         body = resp.get_data(as_text=True)
         self.assertIn("SimpleAgent Chat", body)
         self.assertIn("/api/chat", body)
+        self.assertIn("contextMeterBar", body)
+        self.assertNotIn("Ready. Create a bot if none exist, then chat.", body)
+
+    def test_events_stream_bootstrap_for_bot(self):
+        app = self._make_app()
+        client = app.test_client()
+        bot = self._create_bot(client)
+        resp = client.get(f"/api/events/stream?bot_id={bot['bot_id']}&session_id=s1", buffered=False)
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(str(resp.content_type).startswith("text/event-stream"))
+        first_chunk = next(resp.response).decode("utf-8")
+        self.assertIn("retry:", first_chunk)
+        resp.close()
 
     def test_ops_dashboard_ui_serves(self):
         app = self._make_app()
@@ -475,6 +488,33 @@ class SimpleAgentTests(unittest.TestCase):
         self.assertEqual(len(sessions["sessions"]), 1)
         self.assertEqual(sessions["sessions"][0]["session_id"], "s1")
 
+    def test_chat_context_usage_endpoint_returns_estimate(self):
+        app = self._make_app()
+        client = app.test_client()
+        bot = self._create_bot(client)
+
+        resp = client.post(
+            "/api/context/usage",
+            json={
+                "bot_id": bot["bot_id"],
+                "session_id": "ctx-meter",
+                "model": "test-model",
+                "draft_message": "hello context meter",
+            },
+        )
+        self.assertEqual(resp.status_code, 200, msg=resp.get_data(as_text=True))
+        payload = resp.get_json()
+        self.assertEqual(payload["status"], "ok")
+        self.assertTrue(payload["estimated"])
+        self.assertEqual(payload["bot_id"], bot["bot_id"])
+        self.assertEqual(payload["session_id"], "ctx-meter")
+        self.assertEqual(payload["model"], "test-model")
+        self.assertGreater(payload["current_tokens"], 0)
+        self.assertEqual(payload["max_tokens"], 128000)
+        self.assertGreaterEqual(payload["remaining_tokens"], 0)
+        self.assertGreaterEqual(payload["usage_ratio"], 0)
+        self.assertLessEqual(payload["usage_ratio"], 1)
+
     @patch("app.requests.post")
     def test_chat_isolation_same_session_id_across_bots(self, mock_post):
         mock_post.side_effect = [
@@ -673,6 +713,99 @@ class SimpleAgentTests(unittest.TestCase):
         self.assertEqual(resp.get_json()["response"], "I found relevant links.")
         self.assertEqual(mock_post.call_count, 2)
         self.assertEqual(mock_get.call_count, 1)
+
+    @patch("app.requests.get")
+    @patch("app.requests.post")
+    def test_chat_records_tool_progress_events(self, mock_post, mock_get):
+        mock_post.side_effect = [
+            _MockResp(data={"choices": [{"message": {"content": "<tool:web_search>Berkeley bagels</tool:web_search>"}}]}),
+            _MockResp(data={"choices": [{"message": {"content": "Done."}}]}),
+        ]
+        mock_get.return_value = _MockResp(
+            text='<html><body><a class="result__a" href="https://example.com/bagels">Bagels</a></body></html>',
+            headers={"Content-Type": "text/html"},
+            url="https://duckduckgo.com/html/",
+        )
+
+        app = self._make_app()
+        client = app.test_client()
+        bot = self._create_bot(client)
+        resp = client.post(
+            "/api/chat",
+            json={"bot_id": bot["bot_id"], "session_id": "s-progress", "message": "search now"},
+        )
+        self.assertEqual(resp.status_code, 200)
+
+        events_resp = client.get(f"/api/events?bot_id={bot['bot_id']}")
+        self.assertEqual(events_resp.status_code, 200)
+        events = events_resp.get_json().get("events") or []
+        progress_events = [
+            evt for evt in events
+            if str(evt.get("event_type", "")).strip() == "tool_call_progress"
+            and str(evt.get("session_id", "")).strip() == "s-progress"
+        ]
+        self.assertTrue(progress_events)
+        trace = (progress_events[0].get("tool_trace") or [{}])[0]
+        self.assertEqual(trace.get("tool"), "web_search")
+
+    @patch("app.requests.get")
+    @patch("app.requests.post")
+    def test_web_search_decodes_duckduckgo_redirect_url(self, mock_post, mock_get):
+        mock_post.side_effect = [
+            _MockResp(data={"choices": [{"message": {"content": "<tool:web_search>bagel</tool:web_search>"}}]}),
+            _MockResp(data={"choices": [{"message": {"content": "Done"}}]}),
+        ]
+        mock_get.return_value = _MockResp(
+            text=(
+                '<html><body>'
+                '<a class="result__a" '
+                'href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fbagels&amp;rut=abc">Example</a>'
+                "</body></html>"
+            ),
+            headers={"Content-Type": "text/html"},
+            url="https://duckduckgo.com/html/",
+        )
+
+        app = self._make_app()
+        client = app.test_client()
+        bot = self._create_bot(client)
+        resp = client.post("/api/chat", json={"bot_id": bot["bot_id"], "session_id": "s-web2", "message": "search"})
+        self.assertEqual(resp.status_code, 200)
+        tool_result_payload = mock_post.call_args_list[1].kwargs["json"]["messages"][-1]["content"]
+        self.assertIn("https://example.com/bagels", tool_result_payload)
+
+    @patch("app.requests.get")
+    @patch("app.requests.post")
+    def test_web_search_falls_back_when_duckduckgo_challenge_page_is_returned(self, mock_post, mock_get):
+        mock_post.side_effect = [
+            _MockResp(data={"choices": [{"message": {"content": "<tool:web_search>best food places in Berkeley</tool:web_search>"}}]}),
+            _MockResp(data={"choices": [{"message": {"content": "Done"}}]}),
+        ]
+        ddg_challenge_html = (
+            "<html><body>"
+            "<div class='anomaly-modal__title'>Unfortunately, bots use DuckDuckGo too.</div>"
+            "<form id='challenge-form' action='//duckduckgo.com/anomaly.js'></form>"
+            "</body></html>"
+        )
+        ddg_via_jina_markdown = (
+            "1.[Best Restaurants](https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fberkeley-food&rut=abc)\n"
+            "2.[Another Result](https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.org%2Fplaces&rut=def)\n"
+        )
+        mock_get.side_effect = [
+            _MockResp(text=ddg_challenge_html, headers={"Content-Type": "text/html"}, url="https://duckduckgo.com/html/"),
+            _MockResp(text=ddg_challenge_html, headers={"Content-Type": "text/html"}, url="https://lite.duckduckgo.com/lite/"),
+            _MockResp(text=ddg_via_jina_markdown, headers={"Content-Type": "text/plain"}, url="https://r.jina.ai/http://lite.duckduckgo.com/lite/"),
+        ]
+
+        app = self._make_app()
+        client = app.test_client()
+        bot = self._create_bot(client)
+        resp = client.post("/api/chat", json={"bot_id": bot["bot_id"], "session_id": "s-ddg-fallback", "message": "search"})
+        self.assertEqual(resp.status_code, 200)
+        tool_result_payload = mock_post.call_args_list[1].kwargs["json"]["messages"][-1]["content"]
+        self.assertIn("duckduckgo_lite_via_jina", tool_result_payload)
+        self.assertIn("https://example.com/berkeley-food", tool_result_payload)
+        self.assertEqual(mock_get.call_count, 3)
 
     @patch("app.requests.post")
     def test_chat_web_fetch_blocks_localhost(self, mock_post):
@@ -937,6 +1070,34 @@ class SimpleAgentTests(unittest.TestCase):
 
         resp = client.post("/api/chat", json={"bot_id": bot["bot_id"], "session_id": "mcp-llm", "message": "echo hi"})
         self.assertEqual(resp.status_code, 200)
+        args = mock_call_tool.call_args[0][2]
+        self.assertEqual(args["_bot_id"], bot["bot_id"])
+        self.assertEqual(args["bot_id"], bot["bot_id"])
+
+    @patch("app.DemoMcpServer.call_tool", autospec=True)
+    @patch("app.requests.post")
+    def test_mcp_tool_from_llm_direct_tag_executes(self, mock_post, mock_call_tool):
+        mock_call_tool.return_value = {"ok": True, "devices": [{"id": "cam-1"}]}
+        mock_post.side_effect = [
+            _MockResp(data={"choices": [{"message": {"content": "<tool:demo.time_now>{}</tool:demo.time_now>"}}]}),
+            _MockResp(data={"choices": [{"message": {"content": "Found one device."}}]}),
+        ]
+        app = self._make_app()
+        client = app.test_client()
+        bot = self._create_bot(client)
+
+        resp = client.post("/api/chat", json={"bot_id": bot["bot_id"], "session_id": "mcp-direct-tag", "message": "what devices do you see"})
+        self.assertEqual(resp.status_code, 200)
+        payload = resp.get_json()
+        self.assertEqual(payload["response"], "Found one device.")
+        self.assertEqual(len(payload["tool_trace"]), 1)
+        self.assertEqual(payload["tool_trace"][0]["tool"], "demo.time_now")
+        self.assertEqual(payload["tool_trace"][0]["arguments"], {})
+        self.assertTrue(payload["tool_trace"][0]["ok"])
+        self.assertIsNone(payload["tool_trace"][0]["error"])
+        self.assertEqual(mock_call_tool.call_count, 1)
+        self.assertEqual(mock_post.call_count, 2)
+
         args = mock_call_tool.call_args[0][2]
         self.assertEqual(args["_bot_id"], bot["bot_id"])
         self.assertEqual(args["bot_id"], bot["bot_id"])

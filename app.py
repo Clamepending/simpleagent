@@ -7,6 +7,7 @@ import ipaddress
 import json
 import math
 import os
+import queue
 import re
 import select
 import sqlite3
@@ -16,11 +17,11 @@ import time
 import uuid
 from datetime import datetime, timezone
 from html import unescape
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
 import requests
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request, stream_with_context
 from simpleagent.core.contract import (
     ContractValidationError,
     RUNTIME_CONTRACT_VERSION_V1,
@@ -2111,6 +2112,46 @@ def create_app() -> Flask:
         )
     )
 
+    class _ToolEventStreamBroker:
+        def __init__(self) -> None:
+            self._lock = threading.Lock()
+            self._subscribers: Dict[str, List["queue.Queue[Dict[str, Any]]"]] = {}
+
+        def subscribe(self, bot_id: str) -> "queue.Queue[Dict[str, Any]]":
+            q: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=200)
+            key = _safe_bot_id(bot_id)
+            with self._lock:
+                self._subscribers.setdefault(key, []).append(q)
+            return q
+
+        def unsubscribe(self, bot_id: str, q: "queue.Queue[Dict[str, Any]]") -> None:
+            key = _safe_bot_id(bot_id)
+            with self._lock:
+                queues = self._subscribers.get(key) or []
+                if q in queues:
+                    queues.remove(q)
+                if not queues and key in self._subscribers:
+                    del self._subscribers[key]
+
+        def publish(self, bot_id: str, event: Dict[str, Any]) -> None:
+            key = _safe_bot_id(bot_id)
+            with self._lock:
+                queues = list(self._subscribers.get(key) or [])
+            for q in queues:
+                try:
+                    q.put_nowait(event)
+                except queue.Full:
+                    try:
+                        q.get_nowait()
+                    except Exception:
+                        pass
+                    try:
+                        q.put_nowait(event)
+                    except Exception:
+                        pass
+
+    tool_event_stream_broker = _ToolEventStreamBroker()
+
     forward_enabled = _env_bool_with_legacy("SIMPLEAGENT_FORWARD_ENABLED", False)
     forward_url = _env_str_with_legacy("SIMPLEAGENT_FORWARD_URL", "").strip()
     forward_token = _env_str_with_legacy("SIMPLEAGENT_FORWARD_TOKEN", "").strip()
@@ -2593,10 +2634,35 @@ def create_app() -> Flask:
             text,
             flags=re.DOTALL,
         )
-        if not match:
-            return None
-        tool_name = match.group(1).strip()
-        args_text = match.group(2).strip() or "{}"
+        tool_name = ""
+        args_text = ""
+        if match:
+            tool_name = match.group(1).strip()
+            args_text = match.group(2).strip() or "{}"
+        else:
+            direct_match = re.search(
+                r"<tool:([A-Za-z0-9_.-]+)>\s*(.*?)\s*</tool:\1>",
+                text,
+                flags=re.DOTALL | re.IGNORECASE,
+            )
+            if not direct_match:
+                return None
+            direct_name = direct_match.group(1).strip()
+            if not direct_name:
+                return None
+            normalized_name = direct_name.lower()
+            if normalized_name in {
+                "mcp",
+                "web_search",
+                "web_fetch",
+                "shell",
+                "gateway",
+                "current_time",
+            }:
+                return None
+            tool_name = direct_name
+            args_text = direct_match.group(2).strip() or "{}"
+
         try:
             args_obj = json.loads(args_text)
         except Exception as exc:
@@ -2728,16 +2794,28 @@ def create_app() -> Flask:
         return re.sub(r"<[^>]+>", " ", value or "", flags=re.DOTALL)
 
     def _normalize_result_url(raw_href: str) -> str:
-        href = raw_href.strip()
+        href = unescape(raw_href.strip())
         if not href:
             return ""
-        if href.startswith("//"):
-            href = f"https:{href}"
         if href.startswith("/l/?"):
             parsed = urlparse(href)
-            uddg = parse_qs(parsed.query).get("uddg", [])
+            query_text = parsed.query.replace("&amp;", "&")
+            uddg = parse_qs(query_text).get("uddg", [])
             if uddg:
                 href = unquote(str(uddg[0]))
+        if href.startswith("//"):
+            href = f"https:{href}"
+        parsed = urlparse(href)
+        if (
+            parsed.scheme in {"http", "https"}
+            and (parsed.hostname or "").strip().lower().endswith("duckduckgo.com")
+            and str(parsed.path or "").strip().startswith("/l/")
+        ):
+            query_text = str(parsed.query or "").replace("&amp;", "&")
+            uddg = parse_qs(query_text).get("uddg", [])
+            if uddg:
+                href = unquote(str(uddg[0]))
+                parsed = urlparse(href)
         parsed = urlparse(href)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             return ""
@@ -2745,38 +2823,179 @@ def create_app() -> Flask:
             return ""
         return href
 
+    def _extract_ddg_search_results(html: str, max_results: int) -> List[Dict[str, str]]:
+        results: List[Dict[str, str]] = []
+        seen: set[str] = set()
+
+        for anchor in re.finditer(
+            r"<a\s+([^>]*?)>(.*?)</a>",
+            html or "",
+            flags=re.IGNORECASE | re.DOTALL,
+        ):
+            attrs = str(anchor.group(1) or "")
+            class_match = re.search(
+                r"""class\s*=\s*(["'])(.*?)\1""",
+                attrs,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            classes = str((class_match.group(2) if class_match else "") or "").lower()
+            if "result__a" not in classes and "result-link" not in classes:
+                continue
+
+            href_match = re.search(
+                r"""href\s*=\s*(["'])(.*?)\1""",
+                attrs,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            if not href_match:
+                continue
+            url = _normalize_result_url(str(href_match.group(2) or ""))
+            if not url or url in seen:
+                continue
+
+            title = unescape(_strip_html_tags(anchor.group(2))).strip()
+            if not title:
+                title = url
+            results.append({"title": title[:240], "url": url})
+            seen.add(url)
+            if len(results) >= max(1, int(max_results)):
+                break
+
+        return results
+
+    def _is_ddg_challenge_page(html: str) -> bool:
+        body = (html or "").lower()
+        if not body:
+            return False
+        return (
+            "anomaly-modal" in body
+            or "anomaly.js" in body
+            or "bots use duckduckgo too" in body
+        )
+
+    def _extract_jina_ddg_results(markdown_text: str, max_results: int) -> List[Dict[str, str]]:
+        results: List[Dict[str, str]] = []
+        seen: set[str] = set()
+        for match in re.finditer(
+            r"^\s*\d+\.\[(.*?)\]\((https?://[^\s)]+)\)",
+            markdown_text or "",
+            flags=re.MULTILINE,
+        ):
+            title = unescape(str(match.group(1) or "")).strip()
+            raw_url = unescape(str(match.group(2) or "")).strip()
+            url = _normalize_result_url(raw_url)
+            if not url or url in seen:
+                continue
+            results.append({"title": (title or url)[:240], "url": url})
+            seen.add(url)
+            if len(results) >= max(1, int(max_results)):
+                break
+        return results
+
+    def _extract_bing_rss_results(xml_text: str, max_results: int) -> List[Dict[str, str]]:
+        results: List[Dict[str, str]] = []
+        seen: set[str] = set()
+        for item in re.finditer(
+            r"<item\b[^>]*>(.*?)</item>",
+            xml_text or "",
+            flags=re.IGNORECASE | re.DOTALL,
+        ):
+            item_body = str(item.group(1) or "")
+            title_match = re.search(
+                r"<title\b[^>]*>(.*?)</title>",
+                item_body,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            link_match = re.search(
+                r"<link\b[^>]*>(.*?)</link>",
+                item_body,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            if not link_match:
+                continue
+            raw_url = unescape(str(link_match.group(1) or "")).strip()
+            url = _normalize_result_url(raw_url)
+            if not url or url in seen:
+                continue
+            title = _strip_html_tags(unescape(str((title_match.group(1) if title_match else "") or ""))).strip()
+            results.append({"title": (title or url)[:240], "url": url})
+            seen.add(url)
+            if len(results) >= max(1, int(max_results)):
+                break
+        return results
+
     def _web_search(query: str) -> Dict[str, Any]:
         if not web_enabled_runtime:
             raise RuntimeError("Web tool access is disabled by configuration.")
         q = query.strip()
         if not q:
             raise RuntimeError("web_search query is empty")
-        search_url = f"https://duckduckgo.com/html/?q={quote_plus(q)}"
-        resp = requests.get(
-            search_url,
-            timeout=web_timeout_s,
-            headers={"User-Agent": "simpleagent/1.0"},
+        browser_ua = (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
         )
-        resp.raise_for_status()
-        html = resp.text or ""
-        results: List[Dict[str, str]] = []
-        seen: set[str] = set()
-        for match in re.finditer(
-            r'<a[^>]+class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
-            html,
-            flags=re.IGNORECASE | re.DOTALL,
-        ):
-            url = _normalize_result_url(match.group(1))
-            if not url or url in seen:
+        search_attempts: List[Dict[str, Any]] = [
+            {
+                "source": "duckduckgo_html",
+                "url": f"https://duckduckgo.com/html/?q={quote_plus(q)}",
+                "parser": _extract_ddg_search_results,
+                "challenge_detector": _is_ddg_challenge_page,
+            },
+            {
+                "source": "duckduckgo_lite",
+                "url": f"https://lite.duckduckgo.com/lite/?q={quote_plus(q)}",
+                "parser": _extract_ddg_search_results,
+                "challenge_detector": _is_ddg_challenge_page,
+            },
+            {
+                # Fallback mirror for DDG result pages when DDG serves anti-bot challenge HTML.
+                "source": "duckduckgo_lite_via_jina",
+                "url": f"https://r.jina.ai/http://lite.duckduckgo.com/lite/?q={quote_plus(q)}",
+                "parser": _extract_jina_ddg_results,
+                "challenge_detector": None,
+            },
+            {
+                "source": "bing_rss",
+                "url": f"https://www.bing.com/search?format=rss&q={quote_plus(q)}",
+                "parser": _extract_bing_rss_results,
+                "challenge_detector": None,
+            },
+        ]
+        last_source = "duckduckgo_html"
+        last_error: Optional[Exception] = None
+        successful_fetch = False
+        for attempt in search_attempts:
+            source_name = str(attempt.get("source", "")).strip() or last_source
+            search_url = str(attempt.get("url", "")).strip()
+            parser = attempt.get("parser")
+            challenge_detector = attempt.get("challenge_detector")
+            last_source = source_name
+            try:
+                resp = requests.get(
+                    search_url,
+                    timeout=web_timeout_s,
+                    headers={
+                        "User-Agent": browser_ua,
+                        "Accept-Language": "en-US,en;q=0.9",
+                    },
+                )
+                resp.raise_for_status()
+            except Exception as exc:
+                last_error = exc
                 continue
-            title = unescape(_strip_html_tags(match.group(2))).strip()
-            if not title:
-                title = url
-            results.append({"title": title[:240], "url": url})
-            seen.add(url)
-            if len(results) >= web_search_max_results:
-                break
-        return {"query": q, "results": results, "source": "duckduckgo_html"}
+            successful_fetch = True
+            body = resp.text or ""
+            if callable(challenge_detector) and challenge_detector(body):
+                continue
+            if not callable(parser):
+                continue
+            results = parser(body, web_search_max_results)
+            if results:
+                return {"query": q, "results": results, "source": source_name}
+        if not successful_fetch and last_error is not None:
+            raise RuntimeError(f"web_search failed: {last_error}")
+        return {"query": q, "results": [], "source": last_source}
 
     def _html_to_markdown(html: str) -> str:
         text = html or ""
@@ -2906,6 +3125,50 @@ def create_app() -> Flask:
         if lower.startswith("gemini"):
             return "google", model
         return "openai", model
+
+    _MODEL_CONTEXT_LIMITS_TOKENS: Dict[str, int] = {
+        "gpt-4o-mini": 128_000,
+        "gpt-5.3-codex": 200_000,
+        "gpt-5-thinking-high": 200_000,
+        "gpt-5-mini": 200_000,
+        "gpt-5.2-pro": 200_000,
+        "claude-opus-4-6": 200_000,
+        "claude-sonnet-4-6": 200_000,
+        "claude-haiku-4-5": 200_000,
+        "gemini-3.1-pro": 1_000_000,
+        "gemini-3-flash": 1_000_000,
+    }
+
+    def _max_context_tokens_for_model(model_id: str) -> int:
+        clean = str(model_id or "").strip()
+        if not clean:
+            return 128_000
+        exact = _MODEL_CONTEXT_LIMITS_TOKENS.get(clean)
+        if exact:
+            return int(exact)
+        lowered = clean.lower()
+        if lowered.startswith("gpt-4o"):
+            return 128_000
+        if lowered.startswith("gpt-5") or lowered.startswith("o1") or lowered.startswith("o3") or "codex" in lowered:
+            return 200_000
+        if lowered.startswith("claude"):
+            return 200_000
+        if lowered.startswith("gemini"):
+            return 1_000_000
+        return 128_000
+
+    def _estimate_tokens_for_messages(messages: List[Dict[str, str]]) -> int:
+        # Lightweight approximation for UX/debugging; avoids provider-specific tokenizers.
+        total = 2
+        for message in messages:
+            role = str(message.get("role", "")).strip()
+            content = str(message.get("content", "")).strip()
+            total += 4
+            if role:
+                total += max(1, int(math.ceil(len(role) / 4.0)))
+            if content:
+                total += max(1, int(math.ceil(len(content) / 4.0)))
+        return max(0, int(total))
 
     def _split_messages_for_provider(messages: List[Dict[str, str]]) -> Tuple[str, List[Dict[str, str]]]:
         system_parts: List[str] = []
@@ -3459,26 +3722,71 @@ def create_app() -> Flask:
         session_id: str,
         user_message: str,
         selected_model: Optional[str],
-    ) -> str:
+        on_tool_trace: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Dict[str, Any]:
         bot_id = str(bot["bot_id"])
         messages = _build_llm_messages(bot=bot, session_id=session_id, user_message=user_message)
         mcp_call_happened = False
         forced_mcp_retry = False
+        tool_trace: List[Dict[str, Any]] = []
 
-        for _ in range(shell_max_calls_per_turn + 1):
+        def _record_tool_trace(
+            *,
+            step: int,
+            tool: str,
+            source: str,
+            arguments: Dict[str, Any],
+            ok: bool,
+            result: Optional[Dict[str, Any]],
+            error: Optional[str],
+            started_at: float,
+        ) -> None:
+            tool_trace.append(
+                {
+                    "call_id": f"tc_{max(1, int(step))}",
+                    "tool": str(tool or "").strip(),
+                    "source": str(source or "").strip() or "builtin",
+                    "arguments": arguments if isinstance(arguments, dict) else {},
+                    "ok": bool(ok),
+                    "result": result if isinstance(result, dict) else None,
+                    "error": str(error or "").strip() or None,
+                    "latency_ms": max(0, int((time.time() - started_at) * 1000)),
+                }
+            )
+            if on_tool_trace is not None:
+                try:
+                    on_tool_trace(dict(tool_trace[-1]))
+                except Exception:
+                    pass
+
+        for step in range(1, shell_max_calls_per_turn + 2):
             assistant_text = _call_llm(messages=messages, selected_model=selected_model, bot=bot)
             try:
                 mcp_call = _extract_mcp_tool_call(assistant_text)
             except Exception as exc:
-                return str(exc)
+                return {"assistant_text": str(exc), "tool_trace": tool_trace}
             if mcp_call is not None:
                 tool_name, args = mcp_call
                 if not mcp_enabled_runtime:
-                    return "MCP access is disabled by configuration."
+                    return {"assistant_text": "MCP access is disabled by configuration.", "tool_trace": tool_trace}
                 if tool_name in mcp_disabled_tools:
-                    return f"MCP tool '{tool_name}' is disabled by configuration."
+                    return {
+                        "assistant_text": f"MCP tool '{tool_name}' is disabled by configuration.",
+                        "tool_trace": tool_trace,
+                    }
+                started = time.time()
                 mcp_result = mcp_broker.call_tool(full_name=tool_name, arguments=args, bot_id=bot_id)
                 mcp_call_happened = True
+                _record_tool_trace(
+                    step=step,
+                    tool=tool_name,
+                    source="mcp",
+                    arguments=args,
+                    ok=True,
+                    result={"bot_id": bot_id, "tool": tool_name, "result": mcp_result},
+                    error=None,
+                    started_at=started,
+                )
                 messages.append({"role": "assistant", "content": assistant_text})
                 messages.append(
                     {
@@ -3494,7 +3802,18 @@ def create_app() -> Flask:
 
             web_search_query = _extract_web_search_query(assistant_text)
             if web_search_query:
+                started = time.time()
                 web_result = _web_search(web_search_query)
+                _record_tool_trace(
+                    step=step,
+                    tool="web_search",
+                    source="builtin",
+                    arguments={"value": web_search_query},
+                    ok=True,
+                    result={"bot_id": bot_id, **web_result},
+                    error=None,
+                    started_at=started,
+                )
                 messages.append({"role": "assistant", "content": assistant_text})
                 messages.append(
                     {
@@ -3510,7 +3829,18 @@ def create_app() -> Flask:
 
             web_fetch_url = _extract_web_fetch_url(assistant_text)
             if web_fetch_url:
+                started = time.time()
                 web_result = _web_fetch(web_fetch_url)
+                _record_tool_trace(
+                    step=step,
+                    tool="web_fetch",
+                    source="builtin",
+                    arguments={"value": web_fetch_url},
+                    ok=True,
+                    result={"bot_id": bot_id, **web_result},
+                    error=None,
+                    started_at=started,
+                )
                 messages.append({"role": "assistant", "content": assistant_text})
                 messages.append(
                     {
@@ -3526,7 +3856,18 @@ def create_app() -> Flask:
 
             gateway_call = _extract_gateway_tool_call(assistant_text)
             if gateway_call is not None:
+                started = time.time()
                 gateway_result = _handle_gateway_tool(bot_id=bot_id, call=gateway_call)
+                _record_tool_trace(
+                    step=step,
+                    tool="gateway",
+                    source="gateway",
+                    arguments=gateway_call if isinstance(gateway_call, dict) else {},
+                    ok=bool(gateway_result.get("ok", False)),
+                    result=gateway_result if isinstance(gateway_result, dict) else None,
+                    error=None,
+                    started_at=started,
+                )
                 messages.append({"role": "assistant", "content": assistant_text})
                 messages.append(
                     {
@@ -3541,11 +3882,22 @@ def create_app() -> Flask:
                 continue
 
             if _extract_get_callback_url_call(assistant_text):
+                started = time.time()
                 callback_result = {
                     "bot_id": bot_id,
                     "callback_url": _get_callback_url(),
                     "path": "/hooks/outward_inbox",
                 }
+                _record_tool_trace(
+                    step=step,
+                    tool="get_callback_url",
+                    source="gateway",
+                    arguments={},
+                    ok=True,
+                    result=callback_result,
+                    error=None,
+                    started_at=started,
+                )
                 messages.append({"role": "assistant", "content": assistant_text})
                 messages.append(
                     {
@@ -3561,10 +3913,21 @@ def create_app() -> Flask:
 
             telegram_message = _extract_telegram_send_call(assistant_text)
             if telegram_message is not None:
+                started = time.time()
                 telegram_result = _send_telegram_tool_message(
                     bot=bot,
                     current_session_id=session_id,
                     message_text=telegram_message,
+                )
+                _record_tool_trace(
+                    step=step,
+                    tool="send_telegram_messege",
+                    source="gateway",
+                    arguments={"message": telegram_message},
+                    ok=bool(telegram_result.get("ok", False)),
+                    result=telegram_result if isinstance(telegram_result, dict) else None,
+                    error=None,
+                    started_at=started,
                 )
                 messages.append({"role": "assistant", "content": assistant_text})
                 messages.append(
@@ -3588,10 +3951,13 @@ def create_app() -> Flask:
                     and _mcp_verification_required(user_message, assistant_text)
                 ):
                     if forced_mcp_retry:
-                        return (
-                            "I couldn't verify that in the backend yet. "
-                            "I'll run the MCP tool first before claiming completion."
-                        )
+                        return {
+                            "assistant_text": (
+                                "I couldn't verify that in the backend yet. "
+                                "I'll run the MCP tool first before claiming completion."
+                            ),
+                            "tool_trace": tool_trace,
+                        }
                     forced_mcp_retry = True
                     messages.append({"role": "assistant", "content": assistant_text})
                     messages.append(
@@ -3606,12 +3972,23 @@ def create_app() -> Flask:
                         }
                     )
                     continue
-                return assistant_text
+                return {"assistant_text": assistant_text, "tool_trace": tool_trace}
 
             if not shell_enabled_runtime:
-                return "Shell access is disabled by configuration."
+                return {"assistant_text": "Shell access is disabled by configuration.", "tool_trace": tool_trace}
 
+            started = time.time()
             shell_result = _run_shell(shell_command)
+            _record_tool_trace(
+                step=step,
+                tool="shell",
+                source="builtin",
+                arguments={"value": shell_command},
+                ok=bool(shell_result.get("ok", False)),
+                result={"bot_id": bot_id, **shell_result},
+                error=str(shell_result.get("error", "")).strip() or None,
+                started_at=started,
+            )
             messages.append({"role": "assistant", "content": assistant_text})
             messages.append(
                 {
@@ -3624,7 +4001,10 @@ def create_app() -> Flask:
                 }
             )
 
-        return "I hit the shell tool-call limit for this turn. Please narrow the request and try again."
+        return {
+            "assistant_text": "I hit the shell tool-call limit for this turn. Please narrow the request and try again.",
+            "tool_trace": tool_trace,
+        }
 
     def _process_telegram_message(
         bot_id: str,
@@ -3731,12 +4111,14 @@ def create_app() -> Flask:
         }
 
         selected_model = str(bot.get("model", "")).strip() or default_model
-        assistant_text = _generate_chat_response(
+        chat_result = _generate_chat_response(
             bot=bot,
             session_id=session_id,
             user_message=user_message,
             selected_model=selected_model,
         )
+        assistant_text = str(chat_result.get("assistant_text", "")).strip()
+        tool_trace = chat_result.get("tool_trace") if isinstance(chat_result.get("tool_trace"), list) else []
         state.append_session(bot_id=bot_id, session_id=session_id, role="assistant", content=assistant_text)
         forward_result = _forward(
             bot_id=bot_id,
@@ -3757,12 +4139,14 @@ def create_app() -> Flask:
         event_record["forwarded"] = bool(forward_result.get("ok"))
         event_record["telegram_sent"] = bool(telegram_delivery.get("ok"))
         event_record["assistant_response"] = assistant_text
+        event_record["tool_trace"] = tool_trace
         state.record_event(event_record)
         return {
             "status": "ok",
             "bot_id": bot_id,
             "session_id": session_id,
             "response": assistant_text,
+            "tool_trace": tool_trace,
             "forwarded": bool(forward_result.get("ok")),
             "telegram_sent": bool(telegram_delivery.get("ok")),
             "telegram_delivery": telegram_delivery,
@@ -3803,22 +4187,46 @@ def create_app() -> Flask:
             "task_done": False,
             "model": selected_model,
         }
+        turn_id = f"turn_{uuid.uuid4().hex}"
         event_record = {
             "received_at": time.time(),
             "path": source_path,
+            "event_type": "chat_message",
             "bot_id": bot_id,
             "session_id": session_id,
+            "turn_id": turn_id,
             "payload": chat_payload,
             "rendered_message": user_message,
             "forwarded": False,
         }
         try:
-            assistant_text = _generate_chat_response(
+            progress_seq = 0
+
+            def _on_tool_trace(entry: Dict[str, Any]) -> None:
+                nonlocal progress_seq
+                progress_seq += 1
+                progress_event = {
+                    "received_at": time.time(),
+                    "path": source_path,
+                    "event_type": "tool_call_progress",
+                    "bot_id": bot_id,
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "progress_seq": progress_seq,
+                    "tool_trace": [entry] if isinstance(entry, dict) else [],
+                }
+                state.record_event(progress_event)
+                tool_event_stream_broker.publish(bot_id=bot_id, event=progress_event)
+
+            chat_result = _generate_chat_response(
                 bot=bot,
                 session_id=session_id,
                 user_message=user_message,
                 selected_model=selected_model,
+                on_tool_trace=_on_tool_trace,
             )
+            assistant_text = str(chat_result.get("assistant_text", "")).strip()
+            tool_trace = chat_result.get("tool_trace") if isinstance(chat_result.get("tool_trace"), list) else []
             state.append_session(bot_id=bot_id, session_id=session_id, role="assistant", content=assistant_text)
             forward_result = _forward(
                 bot_id=bot_id,
@@ -3827,13 +4235,16 @@ def create_app() -> Flask:
             )
             event_record["forwarded"] = bool(forward_result.get("ok"))
             event_record["assistant_response"] = assistant_text
+            event_record["tool_trace"] = tool_trace
             state.record_event(event_record)
             return {
                 "status": "ok",
                 "bot_id": bot_id,
                 "session_id": session_id,
+                "turn_id": turn_id,
                 "model": selected_model,
                 "response": assistant_text,
+                "tool_trace": tool_trace,
                 "forwarded": bool(forward_result.get("ok")),
                 "forward_result": forward_result,
             }
@@ -4155,171 +4566,645 @@ def create_app() -> Flask:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>SimpleAgent Chat Tester</title>
+  <title>SimpleAgent Chat</title>
   <style>
+    :root {
+      --bg: #f0f5f6;
+      --surface: #ffffff;
+      --surface-soft: #f6fbfc;
+      --ink: #112431;
+      --ink-soft: #566b78;
+      --line: #cfe0e8;
+      --brand: #0f7f92;
+      --brand-strong: #0b6676;
+      --danger: #a33535;
+      --success: #117a52;
+      --shadow: 0 14px 40px rgba(9, 58, 71, 0.12);
+    }
+    * { box-sizing: border-box; }
     body {
       margin: 0;
-      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
-      background: #0f1220;
-      color: #eef2ff;
+      color: var(--ink);
+      font-family: "IBM Plex Sans", "Avenir Next", "Trebuchet MS", sans-serif;
+      background:
+        radial-gradient(circle at top right, rgba(15, 127, 146, 0.2), rgba(15, 127, 146, 0) 36%),
+        radial-gradient(circle at bottom left, rgba(14, 143, 104, 0.16), rgba(14, 143, 104, 0) 42%),
+        var(--bg);
+      min-height: 100vh;
     }
-    .wrap { max-width: 1160px; margin: 0 auto; padding: 20px 14px 32px; }
-    h1 { margin: 0 0 10px; }
-    .muted { color: #adb7dc; }
-    .layout { display: grid; grid-template-columns: 280px 1fr; gap: 12px; margin-top: 14px; }
-    .panel {
-      background: #171d34;
-      border: 1px solid #2a355f;
-      border-radius: 12px;
-      padding: 10px;
+    .wrap {
+      max-width: 1220px;
+      margin: 0 auto;
+      padding: 24px 16px 34px;
     }
-    .list { max-height: 240px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
-    .btn, button {
-      border: 1px solid #4b69c0;
-      border-radius: 10px;
-      padding: 8px 10px;
-      background: #2f4ea9;
-      color: #fff;
-      cursor: pointer;
-      font-size: 13px;
+    .header {
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 14px;
+      margin-bottom: 14px;
     }
-    .btn.secondary { background: #202b4f; border-color: #3b4d87; }
-    .item {
-      border: 1px solid #334271;
-      border-radius: 9px;
-      background: #11182f;
-      color: #dee7ff;
-      text-align: left;
-      padding: 8px;
+    h1 {
+      margin: 0 0 4px;
+      font-size: 28px;
+      letter-spacing: -0.02em;
+    }
+    .muted {
+      margin: 0;
+      color: var(--ink-soft);
+      font-size: 14px;
+    }
+    .status {
+      margin: 0;
+      padding: 8px 11px;
+      border: 1px solid #bbe2ec;
+      border-radius: 999px;
+      color: #115f6e;
+      background: #e8f8fc;
       font-size: 12px;
-      cursor: pointer;
+      font-weight: 600;
+      white-space: nowrap;
     }
-    .item.active { border-color: #5772cf; background: #1f2d55; }
-    .chat {
-      height: 360px;
-      overflow-y: auto;
-      border: 1px solid #2a355f;
-      border-radius: 10px;
-      padding: 10px;
-      background: #0f1630;
-      margin-bottom: 10px;
-    }
-    .msg { margin-bottom: 8px; padding: 8px 10px; border-radius: 8px; white-space: pre-wrap; word-break: break-word; }
-    .msg.user { background: #2a4ea8; }
-    .msg.assistant { background: #23315c; }
-    .msg.system { background: #293252; }
-    .msg.error { background: #6b2b34; }
-    .row { display: flex; gap: 8px; margin-bottom: 8px; }
-    input[type='text'], input[type='password'], textarea, select {
-      background: #101733;
-      color: #eef2ff;
-      border: 1px solid #31406f;
-      border-radius: 10px;
-      padding: 8px 10px;
-      width: 100%;
-      font-size: 13px;
-      box-sizing: border-box;
-    }
-    textarea { min-height: 88px; font-family: ui-monospace, Menlo, Consolas, monospace; }
-    .section-title { font-size: 12px; color: #bfcbf3; margin: 0 0 6px; }
-    .status { color: #9bf7c2; margin: 8px 0; font-size: 13px; }
-    .meta { font-size: 12px; color: #bac3e3; margin-top: 8px; }
-    .chip { display: inline-block; border: 1px solid #41558f; border-radius: 999px; padding: 2px 8px; font-size: 11px; color: #c6d2ff; }
-    .key-state {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      font-size: 11px;
-      color: #c5d2fb;
-      margin-bottom: 8px;
+    .chip-row {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 12px;
       flex-wrap: wrap;
     }
-    @media (max-width: 980px) {
-      .layout { grid-template-columns: 1fr; }
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      border: 1px solid #c6dbe3;
+      background: #f7fbfc;
+      color: #2f4957;
+      padding: 3px 10px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .tab-strip {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 14px;
+    }
+    .tab-btn {
+      border: 1px solid #bed7df;
+      background: #f7fbfc;
+      color: #2c4a57;
+      border-radius: 999px;
+      padding: 8px 13px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 120ms ease;
+    }
+    .tab-btn.active {
+      border-color: var(--brand);
+      background: var(--brand);
+      color: #fff;
+      box-shadow: 0 8px 20px rgba(15, 127, 146, 0.25);
+    }
+    .tab-panel {
+      display: none;
+      animation: panel-in 160ms ease;
+    }
+    .tab-panel.active { display: block; }
+    @keyframes panel-in {
+      from { opacity: 0; transform: translateY(4px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      box-shadow: var(--shadow);
+      padding: 12px;
+    }
+    .section-title {
+      margin: 0 0 8px;
+      color: #32515e;
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+    }
+    .row {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 8px;
+      align-items: center;
+    }
+    .row.wrap { flex-wrap: wrap; }
+    .col {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      flex: 1;
+      min-width: 0;
+    }
+    .label {
+      color: #496372;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    input[type='text'],
+    input[type='password'],
+    textarea,
+    select {
+      width: 100%;
+      border: 1px solid #c2d8e0;
+      border-radius: 10px;
+      background: #fcfeff;
+      color: var(--ink);
+      padding: 9px 10px;
+      font-size: 13px;
+      outline: none;
+    }
+    input[type='checkbox'] {
+      width: 16px;
+      height: 16px;
+      accent-color: var(--brand);
+    }
+    textarea {
+      min-height: 170px;
+      resize: vertical;
+      font-family: "IBM Plex Mono", "Menlo", "Consolas", monospace;
+    }
+    button {
+      border: 1px solid var(--brand);
+      border-radius: 10px;
+      background: var(--brand);
+      color: #fff;
+      padding: 8px 11px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 130ms ease;
+    }
+    button:hover { background: var(--brand-strong); border-color: var(--brand-strong); }
+    .btn-secondary {
+      background: #edf5f8;
+      color: #265162;
+      border-color: #bdd6e0;
+    }
+    .btn-secondary:hover {
+      background: #dcecf2;
+      border-color: #aac8d4;
+    }
+    .chat-layout {
+      display: grid;
+      grid-template-columns: 320px 1fr;
+      gap: 12px;
+    }
+    .sidebar {
+      display: flex;
+      flex-direction: column;
+      min-height: 620px;
+    }
+    .chat-main {
+      display: flex;
+      flex-direction: column;
+      min-height: 620px;
+    }
+    .panel-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 8px;
+    }
+    .list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      overflow-y: auto;
+      max-height: 230px;
+    }
+    .item {
+      border: 1px solid #ccdde3;
+      border-radius: 10px;
+      background: #f9fcfd;
+      color: #1f3a46;
+      text-align: left;
+      padding: 8px 10px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .item.active {
+      border-color: #9ecdd8;
+      background: #e9f7fb;
+      color: #124a5a;
+    }
+    .chat-top {
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-bottom: 10px;
+    }
+    .chat {
+      flex: 1;
+      min-height: 360px;
+      max-height: 490px;
+      overflow-y: auto;
+      border: 1px solid #c8dce4;
+      border-radius: 12px;
+      background: var(--surface-soft);
+      padding: 11px;
+      margin-bottom: 10px;
+    }
+    .msg {
+      margin-bottom: 8px;
+      padding: 8px 10px;
+      border-radius: 10px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      line-height: 1.35;
+      font-size: 13px;
+    }
+    .msg.user {
+      background: #e4f4fd;
+      border: 1px solid #bdddf0;
+      color: #164d64;
+    }
+    .msg.assistant {
+      background: #eef8ef;
+      border: 1px solid #cbe4cd;
+      color: #1b4f2e;
+    }
+    .msg.system {
+      background: #f4f5f7;
+      border: 1px solid #dde3e7;
+      color: #485862;
+    }
+    .msg.error {
+      background: #fbeeed;
+      border: 1px solid #efc4c0;
+      color: #8c2626;
+    }
+    .tool-trace-group {
+      margin-bottom: 10px;
+      padding: 8px;
+      border-radius: 11px;
+      border: 1px solid #c8d9e0;
+      background: #f9fcfd;
+    }
+    .tool-trace-title {
+      font-size: 11px;
+      font-weight: 700;
+      color: #42616e;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 6px;
+    }
+    .tool-call {
+      border: 1px solid #d4e2e8;
+      border-radius: 9px;
+      background: #ffffff;
+      margin-bottom: 6px;
+      overflow: hidden;
+    }
+    .tool-call summary {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      cursor: pointer;
+      list-style: none;
+      padding: 7px 9px;
+      font-size: 12px;
+    }
+    .tool-call summary::-webkit-details-marker { display: none; }
+    .tool-call summary::after {
+      content: "▸";
+      margin-left: auto;
+      color: #68808b;
+      font-size: 12px;
+      transition: transform 130ms ease;
+    }
+    .tool-call[open] summary::after { transform: rotate(90deg); }
+    .tool-call-state {
+      font-size: 10px;
+      font-weight: 700;
+      border-radius: 999px;
+      padding: 2px 7px;
+      border: 1px solid #b6ced8;
+      background: #eef5f8;
+      color: #315461;
+      white-space: nowrap;
+    }
+    .tool-call-state.ok {
+      border-color: #b8dbc7;
+      background: #edf8f0;
+      color: #1f6a3d;
+    }
+    .tool-call-state.error {
+      border-color: #e3c3c1;
+      background: #fbefef;
+      color: #8b3030;
+    }
+    .tool-call-name {
+      font-weight: 700;
+      color: #244754;
+      word-break: break-word;
+    }
+    .tool-call-meta {
+      font-size: 11px;
+      color: #5f7784;
+      margin-left: auto;
+      padding-right: 8px;
+    }
+    .tool-call-payload {
+      margin: 0;
+      padding: 8px 10px;
+      border-top: 1px solid #e0ebef;
+      background: #f8fcfd;
+      color: #2a4956;
+      font-family: "IBM Plex Mono", "Menlo", "Consolas", monospace;
+      font-size: 11px;
+      line-height: 1.35;
+      overflow-x: auto;
+      white-space: pre;
+    }
+    .compose-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 8px;
+    }
+    .context-meter-wrap {
+      margin-top: 7px;
+      display: grid;
+      gap: 4px;
+    }
+    .context-meter {
+      width: 100%;
+      height: 4px;
+      border-radius: 999px;
+      background: #dce8ed;
+      overflow: hidden;
+    }
+    .context-meter-bar {
+      width: 0%;
+      height: 100%;
+      border-radius: 999px;
+      background: #6a8693;
+      transition: width 130ms ease;
+    }
+    .context-meter-label {
+      font-size: 11px;
+      color: #647d8a;
+      text-align: right;
+      font-family: "IBM Plex Mono", "Menlo", "Consolas", monospace;
+    }
+    .model-row {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+    }
+    .model-row .label { white-space: nowrap; }
+    .model-row select {
+      min-width: 220px;
+      max-width: 280px;
+    }
+    .settings-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .memory-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .tool-list {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .tool-item {
+      border: 1px solid #d3e1e7;
+      border-radius: 10px;
+      padding: 8px 10px;
+      background: #fbfdfe;
+      display: flex;
+      gap: 8px;
+      align-items: flex-start;
+    }
+    .tool-name {
+      font-size: 13px;
+      font-weight: 700;
+      color: #1f3f4c;
+      margin-bottom: 2px;
+    }
+    .tool-desc {
+      font-size: 12px;
+      color: #516977;
+      line-height: 1.3;
+    }
+    .events-log {
+      width: 100%;
+      min-height: 420px;
+      max-height: 620px;
+      overflow: auto;
+      margin: 0;
+      padding: 12px;
+      border-radius: 12px;
+      border: 1px solid #cadce4;
+      background: #f8fcfd;
+      color: #16313b;
+      font-family: "IBM Plex Mono", "Menlo", "Consolas", monospace;
+      font-size: 12px;
+      line-height: 1.4;
+    }
+    .meta {
+      margin-top: 10px;
+      color: #58707d;
+      font-size: 12px;
+    }
+    .empty {
+      border: 1px dashed #c9d9df;
+      border-radius: 10px;
+      padding: 10px;
+      background: #f9fcfd;
+      color: #5d7684;
+      font-size: 12px;
+    }
+    @media (max-width: 1040px) {
+      .chat-layout { grid-template-columns: 1fr; }
+      .sidebar,
+      .chat-main { min-height: 0; }
+      .list { max-height: 180px; }
+      .settings-grid,
+      .memory-grid,
+      .tool-list { grid-template-columns: 1fr; }
+      .model-row select { width: 100%; max-width: none; }
+      .compose-row { grid-template-columns: 1fr; }
     }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <h1>SimpleAgent Chat</h1>
-    <p class="muted">Multi-bot mode. Start with no bots, create a BOT_ID, then chat via <code>/api/chat</code>.</p>
-    <div id="status" class="status">Loading...</div>
+    <header class="header">
+      <div>
+        <h1>SimpleAgent Chat</h1>
+        <p class="muted">Organized UI for <code>/api/chat</code> with tabs for settings, memory, tools, and events.</p>
+      </div>
+      <p id="status" class="status">Loading...</p>
+    </header>
 
-    <div class="layout">
-      <aside class="panel">
-        <div class="section-title">Bots</div>
-        <div class="row">
-          <input id="newBotName" type="text" placeholder="Bot name (optional)" />
-          <button id="createBotBtn" type="button">Create</button>
-        </div>
-        <div id="botList" class="list"></div>
-
-        <div class="section-title" style="margin-top: 10px;">Sessions</div>
-        <div class="row">
-          <button id="newSessionBtn" type="button" class="btn secondary">New Session</button>
-          <button id="refreshSessionsBtn" type="button" class="btn secondary">Refresh</button>
-        </div>
-        <div id="sessionList" class="list"></div>
-      </aside>
-
-      <main class="panel">
-        <div class="row" style="align-items: center;">
-          <span class="chip" id="activeBotChip">No BOT_ID selected</span>
-          <span class="chip" id="activeSessionChip">No session</span>
-        </div>
-
-        <div class="chat" id="chat"></div>
-        <form id="chatForm" class="row">
-          <select id="modelSelect" style="max-width: 220px;"></select>
-          <input id="msgInput" type="text" placeholder="Type a message" required />
-          <button type="submit">Send</button>
-        </form>
-
-        <div class="section-title">Model API Keys</div>
-        <div class="key-state" id="providerKeyState">
-          <span class="chip" id="chipOpenAI">OpenAI: not set</span>
-          <span class="chip" id="chipAnthropic">Anthropic: not set</span>
-          <span class="chip" id="chipGoogle">Google: not set</span>
-        </div>
-        <div class="row">
-          <input id="openaiApiKeyInput" type="password" placeholder="OpenAI API key (sk-...)" />
-          <input id="anthropicApiKeyInput" type="password" placeholder="Anthropic API key (sk-ant-...)" />
-          <input id="googleApiKeyInput" type="password" placeholder="Google API key (AIza...)" />
-        </div>
-        <div class="row">
-          <button id="saveApiKeysBtn" type="button" class="btn secondary">Save API Keys</button>
-        </div>
-
-        <hr style="border-color:#2a355f; margin: 14px 0;">
-
-        <div class="section-title">Selected Bot Config</div>
-        <div class="row">
-          <input id="botNameInput" type="text" placeholder="Bot name" />
-          <input id="botHeartbeatInput" type="text" placeholder="Heartbeat interval seconds" />
-        </div>
-        <div class="row">
-          <select id="botModelInput"></select>
-          <input id="botTelegramTokenInput" type="password" placeholder="Telegram bot token (optional)" />
-        </div>
-        <div class="row">
-          <button id="saveBotConfigBtn" type="button">Save Bot Config</button>
-        </div>
-
-        <div class="section-title">SOUL.md</div>
-        <textarea id="soulInput"></textarea>
-        <div class="row"><button id="saveSoulBtn" type="button" class="btn secondary">Save SOUL.md</button></div>
-
-        <div class="section-title">USER.md</div>
-        <textarea id="userInput"></textarea>
-        <div class="row"><button id="saveUserBtn" type="button" class="btn secondary">Save USER.md</button></div>
-
-        <div class="section-title">HEARTBEAT.md</div>
-        <textarea id="heartbeatInput"></textarea>
-        <div class="row"><button id="saveHeartbeatBtn" type="button" class="btn secondary">Save HEARTBEAT.md</button></div>
-
-        <div class="meta">BOT_ID is attached to chat and tool flows. Telegram owner is permanently assigned on first incoming Telegram message for each bot token.</div>
-      </main>
+    <div class="chip-row">
+      <span class="chip" id="activeBotChip">No BOT_ID selected</span>
+      <span class="chip" id="activeSessionChip">No session</span>
     </div>
+
+    <nav class="tab-strip" role="tablist" aria-label="SimpleAgent sections">
+      <button type="button" class="tab-btn active" data-tab-target="chat">Chat</button>
+      <button type="button" class="tab-btn" data-tab-target="settings">Settings</button>
+      <button type="button" class="tab-btn" data-tab-target="memory">Memory</button>
+      <button type="button" class="tab-btn" data-tab-target="tools">Tools</button>
+      <button type="button" class="tab-btn" data-tab-target="events">Events</button>
+    </nav>
+
+    <section class="tab-panel active" data-tab-panel="chat">
+      <div class="chat-layout">
+        <aside class="card sidebar">
+          <div class="panel-head">
+            <h2 class="section-title">Bots</h2>
+          </div>
+          <div class="row">
+            <input id="newBotName" type="text" placeholder="Bot name (optional)" />
+            <button id="createBotBtn" type="button">Create</button>
+          </div>
+          <div id="botList" class="list"></div>
+
+          <div class="panel-head" style="margin-top: 10px;">
+            <h2 class="section-title" style="margin: 0;">Sessions</h2>
+            <div class="row" style="margin: 0;">
+              <button id="newSessionBtn" type="button" class="btn-secondary">New</button>
+              <button id="refreshSessionsBtn" type="button" class="btn-secondary">Refresh</button>
+            </div>
+          </div>
+          <div id="sessionList" class="list"></div>
+        </aside>
+
+        <main class="card chat-main">
+          <div class="chat-top">
+            <p class="section-title" style="margin: 0;">Conversation</p>
+            <div class="model-row">
+              <label for="modelSelect" class="label">Model</label>
+              <select id="modelSelect"></select>
+            </div>
+          </div>
+          <div class="chat" id="chat"></div>
+          <form id="chatForm" class="compose-row">
+            <input id="msgInput" type="text" placeholder="Type a message" required />
+            <button type="submit">Send</button>
+          </form>
+          <div class="context-meter-wrap">
+            <div class="context-meter"><div id="contextMeterBar" class="context-meter-bar"></div></div>
+            <div id="contextMeterLabel" class="context-meter-label">context: -- / --</div>
+          </div>
+        </main>
+      </div>
+    </section>
+
+    <section class="tab-panel" data-tab-panel="settings">
+      <div class="settings-grid">
+        <div class="card">
+          <h2 class="section-title">Model API Keys</h2>
+          <div class="row wrap" id="providerKeyState">
+            <span class="chip" id="chipOpenAI">OpenAI: not set</span>
+            <span class="chip" id="chipAnthropic">Anthropic: not set</span>
+            <span class="chip" id="chipGoogle">Google: not set</span>
+          </div>
+          <div class="row">
+            <input id="openaiApiKeyInput" type="password" placeholder="OpenAI API key (sk-...)" />
+          </div>
+          <div class="row">
+            <input id="anthropicApiKeyInput" type="password" placeholder="Anthropic API key (sk-ant-...)" />
+          </div>
+          <div class="row">
+            <input id="googleApiKeyInput" type="password" placeholder="Google API key (AIza...)" />
+          </div>
+          <div class="row">
+            <button id="saveApiKeysBtn" type="button" class="btn-secondary">Save API Keys</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2 class="section-title">Selected Bot Config</h2>
+          <div class="row">
+            <input id="botNameInput" type="text" placeholder="Bot name" />
+            <input id="botHeartbeatInput" type="text" placeholder="Heartbeat interval seconds" />
+          </div>
+          <div class="row">
+            <select id="botModelInput"></select>
+            <input id="botTelegramTokenInput" type="password" placeholder="Telegram bot token (optional)" />
+          </div>
+          <div class="row">
+            <button id="saveBotConfigBtn" type="button">Save Bot Config</button>
+          </div>
+          <p class="meta">BOT_ID is attached to chat and tool flows. Telegram owner is permanently assigned on first incoming Telegram message for each bot token.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="tab-panel" data-tab-panel="memory">
+      <div class="memory-grid">
+        <div class="card">
+          <h2 class="section-title">SOUL.md</h2>
+          <textarea id="soulInput"></textarea>
+          <div class="row" style="margin-top: 8px;">
+            <button id="saveSoulBtn" type="button" class="btn-secondary">Save SOUL.md</button>
+          </div>
+        </div>
+        <div class="card">
+          <h2 class="section-title">USER.md</h2>
+          <textarea id="userInput"></textarea>
+          <div class="row" style="margin-top: 8px;">
+            <button id="saveUserBtn" type="button" class="btn-secondary">Save USER.md</button>
+          </div>
+        </div>
+        <div class="card">
+          <h2 class="section-title">HEARTBEAT.md</h2>
+          <textarea id="heartbeatInput"></textarea>
+          <div class="row" style="margin-top: 8px;">
+            <button id="saveHeartbeatBtn" type="button" class="btn-secondary">Save HEARTBEAT.md</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="tab-panel" data-tab-panel="tools">
+      <div class="card">
+        <h2 class="section-title">Runtime Tool Controls</h2>
+        <div class="row wrap">
+          <label class="row" style="margin: 0;"><input id="shellEnabledInput" type="checkbox" /> <span class="label">Shell enabled</span></label>
+          <label class="row" style="margin: 0;"><input id="webEnabledInput" type="checkbox" /> <span class="label">Web enabled</span></label>
+          <label class="row" style="margin: 0;"><input id="mcpEnabledInput" type="checkbox" /> <span class="label">MCP enabled</span></label>
+        </div>
+        <div class="row">
+          <button id="saveToolsBtn" type="button">Save Tool Settings</button>
+          <button id="refreshToolsBtn" type="button" class="btn-secondary">Refresh</button>
+        </div>
+        <div id="toolList" class="tool-list"></div>
+      </div>
+    </section>
+
+    <section class="tab-panel" data-tab-panel="events">
+      <div class="card">
+        <h2 class="section-title">Debug Event Log</h2>
+        <div class="row wrap">
+          <button id="refreshEventsBtn" type="button">Refresh Events</button>
+          <label class="row" style="margin: 0;"><input id="eventsScopedToBot" type="checkbox" checked /> <span class="label">Only selected BOT_ID</span></label>
+          <label class="row" style="margin: 0;"><input id="eventsAutoRefresh" type="checkbox" /> <span class="label">Auto refresh (5s)</span></label>
+        </div>
+        <pre id="eventsLog" class="events-log">Loading events...</pre>
+      </div>
+    </section>
   </div>
 
   <script>
@@ -4343,6 +5228,13 @@ def create_app() -> Flask:
     let selectedBotId = "";
     let selectedSessionId = "";
     let providerKeyState = { openai: false, anthropic: false, google: false };
+    let eventsRefreshTimer = null;
+    let contextUsageRefreshTimer = null;
+    let contextUsageRequestSeq = 0;
+    let sessionsRequestSeq = 0;
+    let sessionHistoryRequestSeq = 0;
+    const pendingSessionIds = new Set();
+    let activeToolStream = null;
 
     const statusEl = document.getElementById("status");
     const botListEl = document.getElementById("botList");
@@ -4359,6 +5251,9 @@ def create_app() -> Flask:
 
     const chatForm = document.getElementById("chatForm");
     const msgInput = document.getElementById("msgInput");
+    const chatSubmitBtn = chatForm.querySelector("button[type='submit']");
+    const contextMeterBarEl = document.getElementById("contextMeterBar");
+    const contextMeterLabelEl = document.getElementById("contextMeterLabel");
 
     const botNameInput = document.getElementById("botNameInput");
     const botModelInput = document.getElementById("botModelInput");
@@ -4379,6 +5274,18 @@ def create_app() -> Flask:
     const chipOpenAI = document.getElementById("chipOpenAI");
     const chipAnthropic = document.getElementById("chipAnthropic");
     const chipGoogle = document.getElementById("chipGoogle");
+    const shellEnabledInput = document.getElementById("shellEnabledInput");
+    const webEnabledInput = document.getElementById("webEnabledInput");
+    const mcpEnabledInput = document.getElementById("mcpEnabledInput");
+    const toolListEl = document.getElementById("toolList");
+    const saveToolsBtn = document.getElementById("saveToolsBtn");
+    const refreshToolsBtn = document.getElementById("refreshToolsBtn");
+    const refreshEventsBtn = document.getElementById("refreshEventsBtn");
+    const eventsScopedToBot = document.getElementById("eventsScopedToBot");
+    const eventsAutoRefresh = document.getElementById("eventsAutoRefresh");
+    const eventsLogEl = document.getElementById("eventsLog");
+    const tabButtons = Array.from(document.querySelectorAll("[data-tab-target]"));
+    const tabPanels = Array.from(document.querySelectorAll("[data-tab-panel]"));
 
     function setStatus(text) { statusEl.textContent = text; }
 
@@ -4390,6 +5297,65 @@ def create_app() -> Flask:
       chatEl.scrollTop = chatEl.scrollHeight;
     }
 
+    function addToolTrace(toolTrace) {
+      const entries = Array.isArray(toolTrace) ? toolTrace : [];
+      if (!entries.length) return;
+
+      const group = document.createElement("div");
+      group.className = "tool-trace-group";
+
+      const title = document.createElement("div");
+      title.className = "tool-trace-title";
+      title.textContent = entries.length === 1 ? "1 Tool Call" : (entries.length + " Tool Calls");
+      group.appendChild(title);
+
+      for (let i = 0; i < entries.length; i += 1) {
+        const entry = entries[i] || {};
+        const ok = !!entry.ok;
+        const details = document.createElement("details");
+        details.className = "tool-call";
+        details.open = false;
+
+        const summary = document.createElement("summary");
+        const state = document.createElement("span");
+        state.className = "tool-call-state " + (ok ? "ok" : "error");
+        state.textContent = ok ? "OK" : "ERROR";
+
+        const name = document.createElement("span");
+        name.className = "tool-call-name";
+        name.textContent = String(entry.tool || "tool");
+
+        const meta = document.createElement("span");
+        meta.className = "tool-call-meta";
+        const callId = String(entry.call_id || ("tc_" + String(i + 1)));
+        const latencyMs = Number(entry.latency_ms || 0);
+        meta.textContent = callId + " \u2022 " + String(latencyMs) + "ms";
+
+        summary.appendChild(state);
+        summary.appendChild(name);
+        summary.appendChild(meta);
+        details.appendChild(summary);
+
+        const payload = document.createElement("pre");
+        payload.className = "tool-call-payload";
+        payload.textContent = JSON.stringify(
+          {
+            source: String(entry.source || ""),
+            arguments: entry.arguments || {},
+            result: entry.result || null,
+            error: entry.error || null,
+          },
+          null,
+          2
+        );
+        details.appendChild(payload);
+        group.appendChild(details);
+      }
+
+      chatEl.appendChild(group);
+      chatEl.scrollTop = chatEl.scrollHeight;
+    }
+
     function clearChat() {
       chatEl.innerHTML = "";
     }
@@ -4397,6 +5363,31 @@ def create_app() -> Flask:
     function setChips() {
       activeBotChip.textContent = selectedBotId ? ("BOT_ID: " + selectedBotId) : "No BOT_ID selected";
       activeSessionChip.textContent = selectedSessionId ? ("Session: " + selectedSessionId) : "No session";
+    }
+
+    function setActiveTab(tabName) {
+      for (const btn of tabButtons) {
+        btn.classList.toggle("active", btn.dataset.tabTarget === tabName);
+      }
+      for (const panel of tabPanels) {
+        panel.classList.toggle("active", panel.dataset.tabPanel === tabName);
+      }
+      if (tabName === "tools") {
+        loadToolsConfig().catch((err) => addMessage("Tools load error: " + err, "error"));
+      }
+      if (tabName === "events") {
+        loadEventsLog().catch((err) => addMessage("Events load error: " + err, "error"));
+      }
+    }
+
+    function clearBotFields() {
+      botNameInput.value = "";
+      botModelInput.innerHTML = "";
+      botTelegramTokenInput.value = "";
+      botHeartbeatInput.value = "";
+      soulInput.value = "";
+      userInput.value = "";
+      heartbeatInput.value = "";
     }
 
     function modelProvider(modelId) {
@@ -4474,6 +5465,128 @@ def create_app() -> Flask:
       return new Date(ts * 1000).toLocaleString();
     }
 
+    function formatTokenCount(n) {
+      const value = Math.max(0, Number(n || 0));
+      if (value >= 1000000) return (value / 1000000).toFixed(2) + "M";
+      if (value >= 1000) return (value / 1000).toFixed(1) + "k";
+      return String(Math.round(value));
+    }
+
+    function setContextMeter(currentTokens, maxTokens) {
+      const current = Math.max(0, Number(currentTokens || 0));
+      const max = Math.max(0, Number(maxTokens || 0));
+      const ratio = max > 0 ? Math.max(0, Math.min(1, current / max)) : 0;
+      contextMeterBarEl.style.width = String((ratio * 100).toFixed(1)) + "%";
+      contextMeterBarEl.style.background =
+        ratio >= 0.9 ? "#a33535" : (ratio >= 0.75 ? "#b16b21" : "#6a8693");
+      contextMeterLabelEl.textContent =
+        "context: " + formatTokenCount(current) + " / " + formatTokenCount(max);
+      contextMeterLabelEl.title = "Estimated prompt context usage for the selected model.";
+    }
+
+    async function refreshContextUsage() {
+      if (!selectedBotId) {
+        setContextMeter(0, 0);
+        contextMeterLabelEl.textContent = "context: -- / --";
+        return;
+      }
+
+      const requestSeq = ++contextUsageRequestSeq;
+      const resp = await fetch("/api/context/usage", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          bot_id: selectedBotId,
+          session_id: selectedSessionId || "default",
+          model: modelSelect.value || "",
+          draft_message: msgInput.value || "",
+        }),
+      });
+      const data = await resp.json();
+      if (requestSeq !== contextUsageRequestSeq) return;
+      if (!resp.ok) throw new Error(data.error || "failed to load context usage");
+      setContextMeter(data.current_tokens, data.max_tokens);
+    }
+
+    function scheduleContextUsageRefresh(delayMs = 120) {
+      if (contextUsageRefreshTimer) {
+        clearTimeout(contextUsageRefreshTimer);
+        contextUsageRefreshTimer = null;
+      }
+      contextUsageRefreshTimer = setTimeout(() => {
+        refreshContextUsage().catch((err) => {
+          const msg = String(err || "").toLowerCase();
+          if (msg.includes("bot_id is required")) {
+            return;
+          }
+          contextMeterLabelEl.textContent = "context: unavailable";
+        });
+      }, Math.max(0, Number(delayMs || 0)));
+    }
+
+    function toolEntryFingerprint(entry) {
+      const obj = entry || {};
+      return JSON.stringify({
+        tool: String(obj.tool || ""),
+        source: String(obj.source || ""),
+        arguments: obj.arguments || {},
+        ok: !!obj.ok,
+        result: obj.result || null,
+        error: obj.error || null,
+      });
+    }
+
+    function stopToolProgressStream() {
+      if (!activeToolStream) return;
+      if (activeToolStream.source) {
+        try { activeToolStream.source.close(); } catch (_) {}
+      }
+      activeToolStream = null;
+    }
+
+    function startToolProgressStream(botId, sessionId) {
+      stopToolProgressStream();
+      const stream = {
+        botId: String(botId || ""),
+        sessionId: String(sessionId || ""),
+        turnId: "",
+        seen: new Set(),
+        source: null,
+      };
+      if (!stream.botId || !stream.sessionId || typeof EventSource === "undefined") {
+        activeToolStream = stream;
+        return stream;
+      }
+      const params = new URLSearchParams({
+        bot_id: stream.botId,
+        session_id: stream.sessionId,
+      });
+      const source = new EventSource("/api/events/stream?" + params.toString());
+      stream.source = source;
+      source.addEventListener("tool_call_progress", (evt) => {
+        let payload = {};
+        try {
+          payload = JSON.parse(evt.data || "{}");
+        } catch (_) {
+          payload = {};
+        }
+        const evtTurnId = String((payload || {}).turn_id || "").trim();
+        if (evtTurnId && stream.turnId && evtTurnId !== stream.turnId) return;
+        if (!stream.turnId && evtTurnId) stream.turnId = evtTurnId;
+        const traces = Array.isArray((payload || {}).tool_trace) ? payload.tool_trace : [];
+        for (const entry of traces) {
+          const fp = toolEntryFingerprint(entry);
+          if (stream.seen.has(fp)) continue;
+          stream.seen.add(fp);
+          addToolTrace([entry]);
+        }
+      });
+      source.addEventListener("ping", () => {});
+      source.onerror = () => {};
+      activeToolStream = stream;
+      return stream;
+    }
+
     async function loadBots(preferredBotId) {
       const resp = await fetch("/api/bots");
       const data = await resp.json();
@@ -4483,14 +5596,19 @@ def create_app() -> Flask:
       botListEl.innerHTML = "";
       if (!bots.length) {
         const empty = document.createElement("div");
-        empty.className = "muted";
+        empty.className = "empty";
         empty.textContent = "No BOT_IDs yet.";
         botListEl.appendChild(empty);
         selectedBotId = "";
         selectedSessionId = "";
+        pendingSessionIds.clear();
+        stopToolProgressStream();
+        clearBotFields();
         setChips();
         clearChat();
         sessionListEl.innerHTML = "";
+        setContextMeter(0, 0);
+        contextMeterLabelEl.textContent = "context: -- / --";
         setStatus("No bots yet. Create one to start chatting.");
         return;
       }
@@ -4510,8 +5628,9 @@ def create_app() -> Flask:
         btn.onclick = async () => {
           selectedBotId = bot.bot_id;
           selectedSessionId = "";
+          pendingSessionIds.clear();
+          stopToolProgressStream();
           await loadBots(selectedBotId);
-          await loadSelectedBot();
         };
         botListEl.appendChild(btn);
       }
@@ -4523,6 +5642,8 @@ def create_app() -> Flask:
     async function loadSelectedBot() {
       if (!selectedBotId) {
         setChips();
+        setContextMeter(0, 0);
+        contextMeterLabelEl.textContent = "context: -- / --";
         return;
       }
       const encodedBotId = encodeURIComponent(selectedBotId);
@@ -4547,43 +5668,75 @@ def create_app() -> Flask:
 
       await loadSessions();
       setChips();
+      scheduleContextUsageRefresh(40);
     }
 
-    async function loadSessions() {
+    async function loadSessions(options = {}) {
+      const refreshHistory = !(options && options.refreshHistory === false);
       if (!selectedBotId) {
         sessionListEl.innerHTML = "";
         setChips();
+        setContextMeter(0, 0);
+        contextMeterLabelEl.textContent = "context: -- / --";
         return;
       }
-      const resp = await fetch("/api/sessions?bot_id=" + encodeURIComponent(selectedBotId));
+      const requestSeq = ++sessionsRequestSeq;
+      const targetBotId = String(selectedBotId || "");
+      const resp = await fetch("/api/sessions?bot_id=" + encodeURIComponent(targetBotId));
       const data = await resp.json();
+      if (requestSeq !== sessionsRequestSeq) return;
+      if (String(selectedBotId || "") !== targetBotId) return;
       if (!resp.ok) throw new Error(data.error || "failed to load sessions");
-      const sessions = Array.isArray(data.sessions) ? data.sessions : [];
-      sessionListEl.innerHTML = "";
+      const sessionsRaw = Array.isArray(data.sessions) ? data.sessions : [];
+      const persisted = sessionsRaw.map((s) => ({
+        session_id: String((s || {}).session_id || "").trim(),
+        message_count: Number((s || {}).message_count || 0),
+        updated_at: Number((s || {}).updated_at || 0),
+        pending: false,
+      })).filter((s) => !!s.session_id);
+      const persistedIds = new Set(persisted.map((s) => s.session_id));
+      for (const pendingId of Array.from(pendingSessionIds)) {
+        if (persistedIds.has(pendingId)) pendingSessionIds.delete(pendingId);
+      }
+      if (!persisted.length && !selectedSessionId) {
+        selectedSessionId = "session-" + Date.now();
+        pendingSessionIds.add(selectedSessionId);
+        clearChat();
+        addMessage("Started new session: " + selectedSessionId, "system");
+      }
 
-      if (!sessions.length) {
+      const pending = Array.from(pendingSessionIds)
+        .filter((id) => !persistedIds.has(id))
+        .map((id) => ({
+          session_id: id,
+          message_count: 0,
+          updated_at: Date.now() / 1000,
+          pending: true,
+        }))
+        .sort((a, b) => String(b.session_id).localeCompare(String(a.session_id)));
+
+      const allSessions = [...pending, ...persisted];
+      sessionListEl.innerHTML = "";
+      if (!allSessions.length) {
         const empty = document.createElement("div");
-        empty.className = "muted";
+        empty.className = "empty";
         empty.textContent = "No sessions yet.";
         sessionListEl.appendChild(empty);
-        if (!selectedSessionId) {
-          selectedSessionId = "session-" + Date.now();
-          clearChat();
-          addMessage("Started new session: " + selectedSessionId, "system");
-        }
         setChips();
+        scheduleContextUsageRefresh(40);
         return;
       }
 
-      if (!selectedSessionId || !sessions.some((s) => s.session_id === selectedSessionId)) {
-        selectedSessionId = sessions[0].session_id;
+      if (!selectedSessionId || !allSessions.some((s) => s.session_id === selectedSessionId)) {
+        selectedSessionId = allSessions[0].session_id;
       }
 
-      for (const s of sessions) {
+      for (const s of allSessions) {
         const btn = document.createElement("button");
         btn.type = "button";
         btn.className = "item" + (s.session_id === selectedSessionId ? " active" : "");
-        btn.textContent = s.session_id + " (" + Number(s.message_count || 0) + ")";
+        const pendingSuffix = s.pending ? " (new)" : "";
+        btn.textContent = s.session_id + pendingSuffix + " (" + Number(s.message_count || 0) + ")";
         btn.title = formatUpdated(Number(s.updated_at || 0));
         btn.onclick = async () => {
           selectedSessionId = s.session_id;
@@ -4593,35 +5746,77 @@ def create_app() -> Flask:
         sessionListEl.appendChild(btn);
       }
 
-      await loadSessionHistory();
+      if (refreshHistory) {
+        await loadSessionHistory();
+      }
       setChips();
+      scheduleContextUsageRefresh(40);
     }
 
     async function loadSessionHistory() {
       if (!selectedBotId || !selectedSessionId) {
         return;
       }
+      const requestSeq = ++sessionHistoryRequestSeq;
+      const targetBotId = String(selectedBotId || "");
+      const targetSessionId = String(selectedSessionId || "");
       const resp = await fetch(
-        "/api/sessions/" + encodeURIComponent(selectedSessionId) + "?bot_id=" + encodeURIComponent(selectedBotId)
+        "/api/sessions/" + encodeURIComponent(targetSessionId) + "?bot_id=" + encodeURIComponent(targetBotId)
       );
       const data = await resp.json();
+      if (requestSeq !== sessionHistoryRequestSeq) return;
+      if (String(selectedBotId || "") !== targetBotId) return;
+      if (String(selectedSessionId || "") !== targetSessionId) return;
       if (!resp.ok) throw new Error(data.error || "failed to load session history");
+
+      const toolTraceQueueByAssistant = new Map();
+      try {
+        const eventsResp = await fetch("/api/events?bot_id=" + encodeURIComponent(targetBotId));
+        const eventsData = await eventsResp.json();
+        if (requestSeq !== sessionHistoryRequestSeq) return;
+        if (String(selectedBotId || "") !== targetBotId) return;
+        if (String(selectedSessionId || "") !== targetSessionId) return;
+        if (eventsResp.ok) {
+          const events = Array.isArray(eventsData.events) ? eventsData.events.slice() : [];
+          events.sort((a, b) => Number((a || {}).received_at || 0) - Number((b || {}).received_at || 0));
+          for (const evt of events) {
+            if (String((evt || {}).session_id || "") !== targetSessionId) continue;
+            if (String((evt || {}).event_type || "").trim() === "tool_call_progress") continue;
+            const traces = Array.isArray(evt.tool_trace) ? evt.tool_trace : [];
+            if (!traces.length) continue;
+            const assistantText = String((evt || {}).assistant_response || "");
+            if (!assistantText) continue;
+            const key = assistantText;
+            if (!toolTraceQueueByAssistant.has(key)) {
+              toolTraceQueueByAssistant.set(key, []);
+            }
+            toolTraceQueueByAssistant.get(key).push(traces);
+          }
+        }
+      } catch (_) {}
 
       clearChat();
       const history = Array.isArray(data.history) ? data.history : [];
       if (!history.length) {
-        addMessage("No messages yet for " + selectedSessionId + ".", "system");
+        addMessage("No messages yet for " + targetSessionId + ".", "system");
       } else {
         for (const item of history) {
           const role = String(item.role || "").trim();
           const content = String(item.content || "");
           if (!content) continue;
           if (role === "user") addMessage("You: " + content, "user");
-          else if (role === "assistant") addMessage("Assistant: " + content, "assistant");
+          else if (role === "assistant") {
+            addMessage("Assistant: " + content, "assistant");
+            const traceQueue = toolTraceQueueByAssistant.get(content);
+            if (traceQueue && traceQueue.length) {
+              addToolTrace(traceQueue.shift());
+            }
+          }
           else addMessage(content, "system");
         }
       }
       setChips();
+      scheduleContextUsageRefresh(40);
     }
 
     async function saveContextFile(name, value) {
@@ -4634,6 +5829,105 @@ def create_app() -> Flask:
       const data = await resp.json();
       if (!resp.ok) throw new Error(data.error || "failed to save " + name);
       addMessage("Saved " + name + " for " + selectedBotId, "system");
+      scheduleContextUsageRefresh(40);
+    }
+
+    function renderTools(config) {
+      const tools = Array.isArray((config || {}).mcp_tools) ? config.mcp_tools : [];
+      shellEnabledInput.checked = !!(config || {}).shell_enabled;
+      webEnabledInput.checked = !!(config || {}).web_enabled;
+      mcpEnabledInput.checked = !!(config || {}).mcp_enabled;
+      toolListEl.innerHTML = "";
+
+      if (!tools.length) {
+        const empty = document.createElement("div");
+        empty.className = "empty";
+        empty.textContent = "No MCP tools available.";
+        toolListEl.appendChild(empty);
+        return;
+      }
+
+      tools.sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
+      for (const tool of tools) {
+        const name = String(tool.name || "").trim();
+        const desc = String(tool.description || "").trim();
+        if (!name) continue;
+
+        const label = document.createElement("label");
+        label.className = "tool-item";
+
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.checked = !!tool.enabled;
+        checkbox.dataset.toolName = name;
+
+        const textWrap = document.createElement("div");
+        const title = document.createElement("div");
+        title.className = "tool-name";
+        title.textContent = name;
+        const info = document.createElement("div");
+        info.className = "tool-desc";
+        info.textContent = desc || "No description.";
+
+        textWrap.appendChild(title);
+        textWrap.appendChild(info);
+        label.appendChild(checkbox);
+        label.appendChild(textWrap);
+        toolListEl.appendChild(label);
+      }
+    }
+
+    async function loadToolsConfig() {
+      const resp = await fetch("/api/config/tools");
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.error || "failed to load tool config");
+      renderTools(data);
+    }
+
+    async function saveToolsConfig() {
+      const toolMap = {};
+      for (const el of toolListEl.querySelectorAll("input[data-tool-name]")) {
+        toolMap[el.dataset.toolName] = !!el.checked;
+      }
+      const payload = {
+        shell_enabled: !!shellEnabledInput.checked,
+        web_enabled: !!webEnabledInput.checked,
+        mcp_enabled: !!mcpEnabledInput.checked,
+        mcp_tools: toolMap,
+      };
+
+      const resp = await fetch("/api/config/tools", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.error || "failed to update tools");
+      renderTools(data);
+      addMessage("Tool settings saved.", "system");
+    }
+
+    async function loadEventsLog() {
+      let url = "/api/events";
+      if (eventsScopedToBot.checked && selectedBotId) {
+        url += "?bot_id=" + encodeURIComponent(selectedBotId);
+      }
+      const resp = await fetch(url);
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.error || "failed to load events");
+      eventsLogEl.textContent = JSON.stringify(data, null, 2);
+    }
+
+    function syncEventsAutoRefresh() {
+      if (eventsRefreshTimer) {
+        clearInterval(eventsRefreshTimer);
+        eventsRefreshTimer = null;
+      }
+      if (eventsAutoRefresh.checked) {
+        eventsRefreshTimer = setInterval(() => {
+          loadEventsLog().catch((err) => addMessage("Events refresh error: " + err, "error"));
+        }, 5000);
+      }
     }
 
     createBotBtn.addEventListener("click", async () => {
@@ -4648,6 +5942,8 @@ def create_app() -> Flask:
         newBotNameInput.value = "";
         selectedBotId = String((data.bot || {}).bot_id || "");
         selectedSessionId = "";
+        pendingSessionIds.clear();
+        stopToolProgressStream();
         addMessage("Created BOT_ID: " + selectedBotId, "system");
         await loadBots(selectedBotId);
       } catch (err) {
@@ -4661,10 +5957,13 @@ def create_app() -> Flask:
         return;
       }
       selectedSessionId = "session-" + Date.now();
+      pendingSessionIds.add(selectedSessionId);
+      stopToolProgressStream();
       clearChat();
       addMessage("Started new session: " + selectedSessionId, "system");
-      await loadSessions();
+      await loadSessions({ refreshHistory: false });
       setChips();
+      scheduleContextUsageRefresh(40);
     });
 
     refreshSessionsBtn.addEventListener("click", async () => {
@@ -4673,6 +5972,7 @@ def create_app() -> Flask:
 
     chatForm.addEventListener("submit", async (e) => {
       e.preventDefault();
+      if (chatForm.dataset.busy === "1") return;
       const text = (msgInput.value || "").trim();
       if (!text) return;
       if (!selectedBotId) {
@@ -4681,18 +5981,26 @@ def create_app() -> Flask:
       }
       if (!selectedSessionId) {
         selectedSessionId = "session-" + Date.now();
+        pendingSessionIds.add(selectedSessionId);
       }
+      chatForm.dataset.busy = "1";
+      if (chatSubmitBtn) chatSubmitBtn.disabled = true;
+      const turnBotId = selectedBotId;
+      const turnSessionId = selectedSessionId;
+      // Cancel any in-flight history render so a stale response can't overwrite this turn.
+      sessionHistoryRequestSeq += 1;
       msgInput.value = "";
       addMessage("You: " + text, "user");
       setChips();
+      const progressStream = startToolProgressStream(turnBotId, turnSessionId);
 
       try {
         const resp = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            bot_id: selectedBotId,
-            session_id: selectedSessionId,
+            bot_id: turnBotId,
+            session_id: turnSessionId,
             message: text,
             model: modelSelect.value || ""
           })
@@ -4702,10 +6010,22 @@ def create_app() -> Flask:
           addMessage("Agent error: " + (data.error || JSON.stringify(data)), "error");
           return;
         }
+        pendingSessionIds.delete(turnSessionId);
+        const finalTrace = Array.isArray(data.tool_trace) ? data.tool_trace : [];
+        const unseenFinalTrace = finalTrace.filter(
+          (entry) => !(progressStream && progressStream.seen.has(toolEntryFingerprint(entry)))
+        );
+        addToolTrace(unseenFinalTrace);
         addMessage("Assistant: " + String(data.response || ""), "assistant");
-        await loadSessions();
+        await loadSessions({ refreshHistory: false });
+        scheduleContextUsageRefresh(40);
       } catch (err) {
         addMessage("Chat request error: " + err, "error");
+        scheduleContextUsageRefresh(40);
+      } finally {
+        stopToolProgressStream();
+        chatForm.dataset.busy = "0";
+        if (chatSubmitBtn) chatSubmitBtn.disabled = false;
       }
     });
 
@@ -4774,6 +6094,56 @@ def create_app() -> Flask:
       }
     });
 
+    saveToolsBtn.addEventListener("click", async () => {
+      try {
+        await saveToolsConfig();
+      } catch (err) {
+        addMessage("Save tools error: " + err, "error");
+      }
+    });
+
+    refreshToolsBtn.addEventListener("click", async () => {
+      try {
+        await loadToolsConfig();
+      } catch (err) {
+        addMessage("Refresh tools error: " + err, "error");
+      }
+    });
+
+    refreshEventsBtn.addEventListener("click", async () => {
+      try {
+        await loadEventsLog();
+      } catch (err) {
+        addMessage("Refresh events error: " + err, "error");
+      }
+    });
+
+    eventsScopedToBot.addEventListener("change", async () => {
+      try {
+        await loadEventsLog();
+      } catch (err) {
+        addMessage("Events scope error: " + err, "error");
+      }
+    });
+
+    eventsAutoRefresh.addEventListener("change", () => {
+      syncEventsAutoRefresh();
+    });
+
+    msgInput.addEventListener("input", () => {
+      scheduleContextUsageRefresh(120);
+    });
+
+    modelSelect.addEventListener("change", () => {
+      scheduleContextUsageRefresh(40);
+    });
+
+    for (const btn of tabButtons) {
+      btn.addEventListener("click", () => {
+        setActiveTab(btn.dataset.tabTarget || "chat");
+      });
+    }
+
     saveSoulBtn.addEventListener("click", async () => {
       try { await saveContextFile("SOUL.md", soulInput.value || ""); } catch (err) { addMessage(String(err), "error"); }
     });
@@ -4789,7 +6159,11 @@ def create_app() -> Flask:
         await loadProviderKeyState();
         setStatus("Loading bots...");
         await loadBots("");
-        addMessage("Ready. Create a bot if none exist, then chat.", "system");
+        await loadToolsConfig();
+        await loadEventsLog();
+        setActiveTab("chat");
+        scheduleContextUsageRefresh(10);
+        setStatus("Ready");
       } catch (err) {
         setStatus("Error loading app state");
         addMessage("Bootstrap error: " + err, "error");
@@ -5819,6 +7193,44 @@ def create_app() -> Flask:
         clean_bot_id = _safe_bot_id(bot_id) if bot_id else None
         return jsonify({"status": "ok", **state.snapshot(bot_id=clean_bot_id)})
 
+    @app.route("/api/events/stream", methods=["GET"])
+    def events_stream():
+        bot_id = _safe_bot_id(str(request.args.get("bot_id", "")).strip())
+        if not bot_id:
+            return jsonify({"status": "error", "error": "bot_id is required"}), 400
+        try:
+            _require_bot(bot_id)
+        except Exception as exc:
+            return jsonify({"status": "error", "error": str(exc)}), 404
+        session_id_filter = str(request.args.get("session_id", "")).strip()
+        subscription = tool_event_stream_broker.subscribe(bot_id=bot_id)
+
+        def _stream() -> Any:
+            yield "retry: 1000\n\n"
+            try:
+                while True:
+                    try:
+                        event = subscription.get(timeout=15)
+                    except queue.Empty:
+                        yield "event: ping\ndata: {}\n\n"
+                        continue
+                    if session_id_filter and str((event or {}).get("session_id", "")).strip() != session_id_filter:
+                        continue
+                    payload = json.dumps(event if isinstance(event, dict) else {}, ensure_ascii=True)
+                    yield f"event: tool_call_progress\ndata: {payload}\n\n"
+            finally:
+                tool_event_stream_broker.unsubscribe(bot_id=bot_id, q=subscription)
+
+        return Response(
+            stream_with_context(_stream()),
+            mimetype="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     @app.route("/api/queue/stats", methods=["GET"])
     def queue_stats():
         return jsonify(
@@ -6555,6 +7967,47 @@ def create_app() -> Flask:
         except Exception as exc:
             return jsonify({"status": "error", "error": str(exc)}), 404
         return jsonify({"status": "ok", "bot_id": bot_id, "sessions": state.list_sessions(bot_id)})
+
+    @app.route("/api/context/usage", methods=["POST"])
+    def chat_context():
+        data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict):
+            return jsonify({"status": "error", "error": "JSON body is required"}), 400
+
+        try:
+            bot_id = _require_bot_id_from_request(data, required=True)
+            bot = _require_bot(bot_id)
+        except Exception as exc:
+            return jsonify({"status": "error", "error": str(exc)}), 400
+
+        session_id = str(data.get("session_id", "")).strip() or "default"
+        selected_model = str(data.get("model", "")).strip() or str(bot.get("model", "")).strip() or default_model
+        draft_message = str(data.get("draft_message", ""))
+
+        try:
+            messages = _build_llm_messages(bot=bot, session_id=session_id, user_message=draft_message)
+            current_tokens = _estimate_tokens_for_messages(messages)
+            max_tokens = _max_context_tokens_for_model(selected_model)
+            remaining_tokens = max(0, int(max_tokens) - int(current_tokens))
+            usage_ratio = 0.0
+            if max_tokens > 0:
+                usage_ratio = max(0.0, min(1.0, float(current_tokens) / float(max_tokens)))
+
+            return jsonify(
+                {
+                    "status": "ok",
+                    "estimated": True,
+                    "bot_id": bot_id,
+                    "session_id": session_id,
+                    "model": selected_model,
+                    "current_tokens": int(current_tokens),
+                    "max_tokens": int(max_tokens),
+                    "remaining_tokens": int(remaining_tokens),
+                    "usage_ratio": usage_ratio,
+                }
+            )
+        except Exception as exc:
+            return jsonify({"status": "error", "error": str(exc), "bot_id": bot_id, "session_id": session_id}), 502
 
     @app.route("/api/config/telegram", methods=["POST"])
     def update_telegram_config():
