@@ -21,7 +21,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
 import requests
-from flask import Flask, Response, jsonify, request, stream_with_context
+from flask import Flask, Response, g, jsonify, request, stream_with_context
 from simpleagent.core.contract import (
     ContractValidationError,
     RUNTIME_CONTRACT_VERSION_V1,
@@ -2181,7 +2181,7 @@ def create_app() -> Flask:
     )
     anthropic_api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     google_api_key = os.getenv("GOOGLE_API_KEY", "").strip()
-    gateway_token = os.getenv("GATEWAY_TOKEN", "").strip()
+    gateway_token = os.getenv("GATEWAY_TOKEN", "").strip() or os.getenv("OPENCLAW_GATEWAY_TOKEN", "").strip()
     gateway_tool_url = _env_str_with_legacy("SIMPLEAGENT_GATEWAY_TOOL_URL", "").strip()
     bot_context_root = _env_str_with_legacy("SIMPLEAGENT_BOT_CONTEXT_DIR", "./bot_context").strip() or "./bot_context"
     service_mode_raw = _env_str_with_legacy("SIMPLEAGENT_SERVICE_MODE", "all").strip().lower() or "all"
@@ -2264,6 +2264,67 @@ def create_app() -> Flask:
     }
 
     mcp_broker = McpBroker(enabled=True, timeout_s=mcp_timeout_s, servers_json=mcp_servers_json)
+    gateway_cookie_name = "_simpleagent_gateway_token"
+
+    def _bearer_token_from_request() -> str:
+        auth_header = str(request.headers.get("Authorization", "")).strip()
+        if auth_header.lower().startswith("bearer "):
+            return auth_header[7:].strip()
+        return ""
+
+    def _request_presents_gateway_token() -> bool:
+        if not gateway_token:
+            return True
+        query_token = str(request.args.get("token", "")).strip()
+        cookie_token = str(request.cookies.get(gateway_cookie_name, "")).strip()
+        header_token = _bearer_token_from_request()
+        return gateway_token in {query_token, cookie_token, header_token}
+
+    def _is_public_without_gateway_token(path: str) -> bool:
+        public_exact = {
+            "/health",
+            "/livez",
+            "/readyz",
+            "/api/livez",
+            "/api/readyz",
+            "/v1/health",
+            "/v1/capabilities",
+        }
+        if path in public_exact:
+            return True
+        if path.startswith("/api/telegram/webhook/"):
+            return True
+        return False
+
+    @app.before_request
+    def _enforce_gateway_token_for_ui_and_api():
+        if not gateway_token:
+            return None
+        if request.method == "OPTIONS":
+            return None
+        path = str(request.path or "")
+        if _is_public_without_gateway_token(path):
+            return None
+        if not _request_presents_gateway_token():
+            return jsonify({"status": "error", "error": "unauthorized"}), 401
+        if str(request.args.get("token", "")).strip() == gateway_token:
+            g._set_gateway_cookie = True
+        return None
+
+    @app.after_request
+    def _persist_gateway_token_cookie(response: Response):
+        if gateway_token and bool(getattr(g, "_set_gateway_cookie", False)):
+            forwarded_proto = str(request.headers.get("X-Forwarded-Proto", "")).strip().lower()
+            secure_cookie = bool(request.is_secure or forwarded_proto == "https")
+            response.set_cookie(
+                gateway_cookie_name,
+                gateway_token,
+                max_age=86400,
+                httponly=True,
+                secure=secure_cookie,
+                samesite="Lax",
+            )
+        return response
 
     def _new_bot_id() -> str:
         return f"bot-{uuid.uuid4().hex[:12]}"
