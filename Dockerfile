@@ -11,6 +11,7 @@ COPY pyproject.toml uv.lock /app/
 RUN uv sync --frozen --no-install-project
 
 COPY app.py /app/app.py
+COPY simpleagent /app/simpleagent
 
 ENV PATH="/app/.venv/bin:$PATH"
 
